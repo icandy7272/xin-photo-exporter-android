@@ -203,6 +203,74 @@ def read_current_logcat(
     return result.stdout
 
 
+def start_logcat_stream(
+    device: Device,
+    pid: int,
+    popen: Callable = subprocess.Popen,
+):
+    try:
+        return popen(
+            [
+                str(ADB),
+                "-s",
+                device.serial,
+                "logcat",
+                f"--pid={pid}",
+                "-v",
+                "brief",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            errors="replace",
+            bufsize=1,
+        )
+    except OSError:
+        raise SmokeError("logcat-stream-failed") from None
+
+
+def _stop_logcat_process(process) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+
+
+def collect_streaming_urls(
+    device: Device,
+    pid: int,
+    *,
+    popen: Callable = subprocess.Popen,
+    progress: Callable[[str], None] = print,
+) -> list[str]:
+    process = start_logcat_stream(device, pid, popen)
+    if process.stdout is None:
+        _stop_logcat_process(process)
+        raise SmokeError("logcat-stream-failed")
+    ordered: list[str] = []
+    seen: set[str] = set()
+    user_stopped = False
+    try:
+        for line in process.stdout:
+            for url in extract_urls(line):
+                if url not in seen:
+                    seen.add(url)
+                    ordered.append(url)
+                    progress(f"已发现唯一原图：{len(ordered)}")
+    except KeyboardInterrupt:
+        user_stopped = True
+    except Exception:
+        raise SmokeError("logcat-stream-failed") from None
+    finally:
+        _stop_logcat_process(process)
+    if not user_stopped:
+        raise SmokeError("logcat-stream-failed")
+    return ordered
+
+
 def apply_record_date(
     destination: Path,
     record_date: date | None,
@@ -374,6 +442,40 @@ def run_smoke(
     return downloader(samples, destination)
 
 
+def confirm_download(candidate_count: int, input_fn: Callable = input) -> bool:
+    try:
+        answer = input_fn(
+            f"已发现 {candidate_count} 个唯一原图候选。输入 DOWNLOAD 开始下载："
+        )
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer == "DOWNLOAD"
+
+
+def run_batch(
+    *,
+    run_command: Callable = run_command,
+    popen: Callable = subprocess.Popen,
+    input_fn: Callable = input,
+    downloader: Callable | None = None,
+    output_dir: Path = BATCH_OUTPUT,
+) -> int:
+    device = discover_running_device(run_command)
+    pid = discover_app_pid(device, run_command)
+    print("批量采集已启动；请在 MuMu 中手动滚动，完成后按 Ctrl-C。")
+    candidates = collect_streaming_urls(device, pid, popen=popen)
+    print(f"采集结束：{len(candidates)} 个唯一原图候选。")
+    if not candidates:
+        print("没有候选，不创建输出目录。")
+        return 0
+    if not confirm_download(len(candidates), input_fn):
+        print("已取消；没有下载照片。")
+        return 0
+    if downloader is None:
+        raise SmokeError("batch-downloader-not-ready")
+    return downloader(candidates, output_dir)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="鑫时光集 Android 原图 Smoke 验证")
     parser.add_argument(
@@ -381,11 +483,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="明确下载且只下载三个原图样本",
     )
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("batch", help="手动滚动并流式采集批量原图")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "batch":
+        return run_batch()
     return run_smoke(execute=args.execute)
 
 

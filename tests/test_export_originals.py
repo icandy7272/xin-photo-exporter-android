@@ -423,5 +423,167 @@ class BatchDateTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), original)
 
 
+class InterruptingLines:
+    def __init__(self, lines):
+        self.lines = iter(lines)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self.lines)
+        except StopIteration:
+            raise KeyboardInterrupt
+
+
+class FakeLogcatProcess:
+    def __init__(self, stdout, returncode=None, timeout_once=False):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.timeout_once = timeout_once
+        self.terminated = False
+        self.killed = False
+        self.wait_calls = []
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        self.wait_calls.append(timeout)
+        if self.timeout_once:
+            self.timeout_once = False
+            raise subprocess.TimeoutExpired("adb", timeout)
+        self.returncode = 0 if self.returncode is None else self.returncode
+        return self.returncode
+
+
+class StreamingCollectorTests(unittest.TestCase):
+    def make_factory(self, process, calls):
+        def factory(argv, **kwargs):
+            calls.append(([str(value) for value in argv], kwargs))
+            return process
+
+        return factory
+
+    def test_collects_ordered_unique_candidates_and_cleans_up(self):
+        host = export_originals.CDN_HOST
+        first = f"https://{host}/moments/images/2026-06-04/a.jpeg"
+        second = f"https://{host}/moments/images/2026-06-05/b.jpeg"
+        lines = InterruptingLines(
+            [
+                f"I/PictureSelector: 原图地址::{first}\n",
+                f"I/PictureSelector: 原图地址::{first}\n",
+                f"I/PictureSelector: 压缩地址::{second}\n",
+                f"I/PictureSelector: 原图地址::{second}\n",
+                "I/PictureSelector: 原图地址::https://evil.example/x.jpeg\n",
+            ]
+        )
+        process = FakeLogcatProcess(lines)
+        calls = []
+        progress = []
+        urls = export_originals.collect_streaming_urls(
+            export_originals.Device("127.0.0.1:16384"),
+            2468,
+            popen=self.make_factory(process, calls),
+            progress=progress.append,
+        )
+        self.assertEqual(urls, [first, second])
+        self.assertEqual(progress, ["已发现唯一原图：1", "已发现唯一原图：2"])
+        self.assertTrue(process.terminated)
+        self.assertEqual(process.wait_calls, [2])
+        argv, kwargs = calls[0]
+        self.assertEqual(
+            argv,
+            [
+                str(export_originals.ADB),
+                "-s",
+                "127.0.0.1:16384",
+                "logcat",
+                "--pid=2468",
+                "-v",
+                "brief",
+            ],
+        )
+        self.assertFalse(any("https://" in value for value in argv))
+        self.assertEqual(kwargs["text"], True)
+        self.assertEqual(kwargs["errors"], "replace")
+        self.assertNotIn("https://", "\n".join(progress))
+
+    def test_wait_timeout_kills_and_waits_again(self):
+        process = FakeLogcatProcess(InterruptingLines([]), timeout_once=True)
+        urls = export_originals.collect_streaming_urls(
+            export_originals.Device("serial"),
+            1,
+            popen=lambda *args, **kwargs: process,
+            progress=lambda value: None,
+        )
+        self.assertEqual(urls, [])
+        self.assertTrue(process.killed)
+        self.assertEqual(process.wait_calls, [2, 2])
+
+    def test_spawn_stdout_and_unexpected_exit_fail_redacted(self):
+        cases = [
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("private")),
+            lambda *args, **kwargs: FakeLogcatProcess(None, returncode=1),
+            lambda *args, **kwargs: FakeLogcatProcess(iter([]), returncode=1),
+        ]
+        for factory in cases:
+            with self.subTest(factory=factory):
+                with self.assertRaisesRegex(
+                    export_originals.SmokeError, "logcat-stream-failed"
+                ) as raised:
+                    export_originals.collect_streaming_urls(
+                        export_originals.Device("serial"), 1, popen=factory
+                    )
+                self.assertNotIn("private", str(raised.exception))
+
+
+class BatchCliTests(unittest.TestCase):
+    def test_main_dispatches_batch_without_touching_smoke(self):
+        with mock.patch.object(export_originals, "run_batch", return_value=0) as batch:
+            with mock.patch.object(export_originals, "run_smoke") as smoke:
+                self.assertEqual(export_originals.main(["batch"]), 0)
+        batch.assert_called_once_with()
+        smoke.assert_not_called()
+
+    def test_exact_download_confirmation_only(self):
+        self.assertTrue(export_originals.confirm_download(3, lambda prompt: "DOWNLOAD"))
+        for answer in ("", "download", " DOWNLOAD", "DOWNLOAD ", "yes"):
+            with self.subTest(answer=answer):
+                self.assertFalse(
+                    export_originals.confirm_download(3, lambda prompt, a=answer: a)
+                )
+        self.assertFalse(
+            export_originals.confirm_download(
+                3, lambda prompt: (_ for _ in ()).throw(EOFError)
+            )
+        )
+
+    def test_zero_candidates_and_cancel_never_download_or_create_output(self):
+        runner = FakeRunner(MuMuDiscoveryTests.RUNNING)
+        for candidates, answer in (([], "DOWNLOAD"), (["private-url"], "")):
+            with self.subTest(candidates=candidates), tempfile.TemporaryDirectory() as temp:
+                output = Path(temp) / "must-not-exist"
+                with mock.patch.object(
+                    export_originals, "collect_streaming_urls", return_value=candidates
+                ):
+                    result = export_originals.run_batch(
+                        run_command=runner,
+                        input_fn=lambda prompt, a=answer: a,
+                        downloader=lambda *args, **kwargs: self.fail("download called"),
+                        output_dir=output,
+                )
+                self.assertEqual(result, 0)
+                self.assertFalse(output.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
