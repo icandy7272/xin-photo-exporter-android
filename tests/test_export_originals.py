@@ -584,6 +584,181 @@ class BatchCliTests(unittest.TestCase):
                 self.assertEqual(result, 0)
                 self.assertFalse(output.exists())
 
+    def test_approved_batch_summary_controls_exit_and_completion_phrase(self):
+        runner = FakeRunner(MuMuDiscoveryTests.RUNNING)
+        candidate = f"https://{export_originals.CDN_HOST}/a.jpeg"
+        for summary, expected, phrase in (
+            (export_originals.BatchSummary(1, 1, 0, 0, 0, 0), 0, True),
+            (export_originals.BatchSummary(1, 0, 0, 1, 0, 0), 1, False),
+        ):
+            with self.subTest(summary=summary):
+                stream = io.StringIO()
+                with mock.patch.object(
+                    export_originals, "collect_streaming_urls", return_value=[candidate]
+                ), redirect_stdout(stream):
+                    result = export_originals.run_batch(
+                        run_command=runner,
+                        input_fn=lambda prompt: "DOWNLOAD",
+                        downloader=lambda *args, value=summary, **kwargs: value,
+                    )
+                self.assertEqual(result, expected)
+                self.assertEqual("本轮候选下载完成" in stream.getvalue(), phrase)
+                self.assertNotIn("账号全量完成", stream.getvalue())
+
+
+class BatchDownloadTests(unittest.TestCase):
+    JPEG = b"\xff\xd8" + b"z" * 2048
+
+    def url(self, name="a"):
+        return (
+            f"https://{export_originals.CDN_HOST}/moments/images/"
+            f"2026-06-04/{name}.jpeg"
+        )
+
+    def test_valid_existing_skips_network_and_reapplies_date(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            destination = export_originals.batch_destination(self.url(), output)
+            destination.write_bytes(self.JPEG)
+            dates = []
+
+            class ForbiddenOpener:
+                def open(self, *args, **kwargs):
+                    raise AssertionError("network must not be called")
+
+            outcome = export_originals.download_batch_candidate(
+                self.url(),
+                output,
+                opener=ForbiddenOpener(),
+                date_setter=lambda path, value: dates.append((path, value)) or True,
+            )
+            self.assertEqual(outcome.status, "existing")
+            self.assertFalse(outcome.date_failed)
+            self.assertEqual(dates, [(destination, date(2026, 6, 4))])
+
+    def test_invalid_final_is_preserved_on_failure_and_replaced_on_success(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            destination = export_originals.batch_destination(self.url(), output)
+            original = b"not-a-jpeg"
+            destination.write_bytes(original)
+            failed = export_originals.download_batch_candidate(
+                self.url(),
+                output,
+                opener=FakeOpener([OSError("network")]),
+                date_setter=lambda *args: True,
+            )
+            self.assertEqual(failed.status, "failed")
+            self.assertEqual(destination.read_bytes(), original)
+
+            stale = destination.with_suffix(".jpeg.part")
+            stale.write_bytes(b"stale-private-data")
+            succeeded = export_originals.download_batch_candidate(
+                self.url(),
+                output,
+                opener=FakeOpener([FakeResponse(self.JPEG)]),
+                date_setter=lambda *args: True,
+            )
+            self.assertEqual(succeeded.status, "downloaded")
+            self.assertEqual(destination.read_bytes(), self.JPEG)
+            self.assertFalse(stale.exists())
+
+    def test_too_small_or_non_soi_existing_is_not_valid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "candidate.jpeg"
+            for body in (b"\xff\xd8short", b"NO" + b"x" * 2048):
+                path.write_bytes(body)
+                self.assertFalse(export_originals.looks_like_existing_jpeg(path))
+
+
+class BatchRetryTests(unittest.TestCase):
+    def test_first_pass_continues_and_only_failures_retry_twice(self):
+        urls = ["private-one", "private-two", "private-three"]
+        scripted = {
+            urls[0]: ["failed", "downloaded"],
+            urls[1]: ["downloaded"],
+            urls[2]: ["failed", "failed", "failed"],
+        }
+        calls = []
+        sleeps = []
+
+        def candidate(url, output_dir, *, opener, date_setter):
+            calls.append(url)
+            status = scripted[url].pop(0)
+            return export_originals.CandidateOutcome(
+                status, date_failed=(url == urls[1])
+            )
+
+        with tempfile.TemporaryDirectory() as temp:
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                summary = export_originals.download_batch(
+                    urls,
+                    Path(temp) / "originals",
+                    opener=object(),
+                    sleep_fn=sleeps.append,
+                    candidate_downloader=candidate,
+                )
+        self.assertEqual(
+            calls,
+            [urls[0], urls[1], urls[2], urls[0], urls[2], urls[2]],
+        )
+        self.assertEqual(sleeps, [2, 2])
+        self.assertEqual(summary.total, 3)
+        self.assertEqual(summary.downloaded, 2)
+        self.assertEqual(summary.existing, 0)
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(summary.date_failed, 1)
+        self.assertEqual(summary.unprocessed, 0)
+        self.assertEqual(
+            summary.total,
+            summary.downloaded + summary.existing + summary.failed + summary.unprocessed,
+        )
+        self.assertNotIn("private-one", stream.getvalue())
+        self.assertNotIn("private-two", stream.getvalue())
+        self.assertNotIn("private-three", stream.getvalue())
+
+    def test_interrupt_marks_current_unattempted_and_retry_queue_unprocessed(self):
+        urls = ["one", "two", "three"]
+        calls = []
+
+        def candidate(url, output_dir, *, opener, date_setter):
+            calls.append(url)
+            if url == "one":
+                return export_originals.CandidateOutcome("failed")
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as temp:
+            summary = export_originals.download_batch(
+                urls,
+                Path(temp) / "originals",
+                opener=object(),
+                sleep_fn=lambda value: None,
+                candidate_downloader=candidate,
+            )
+        self.assertEqual(calls, ["one", "two"])
+        self.assertEqual(summary.failed, 0)
+        self.assertEqual(summary.unprocessed, 3)
+        self.assertEqual(
+            summary.total,
+            summary.downloaded + summary.existing + summary.failed + summary.unprocessed,
+        )
+
+    def test_keyboard_interrupt_during_read_removes_part(self):
+        class InterruptResponse(FakeResponse):
+            def read(self, size=-1):
+                raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "candidate.jpeg"
+            with self.assertRaises(KeyboardInterrupt):
+                export_originals.download_sample(
+                    FakeOpener([InterruptResponse(b"")]),
+                    "https://example.invalid/private.jpeg",
+                    destination,
+                )
+            self.assertFalse(destination.with_suffix(".jpeg.part").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

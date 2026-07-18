@@ -10,6 +10,7 @@ import os
 import re
 import ssl
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -51,6 +52,22 @@ class Device:
 class DownloadResult:
     byte_count: int
     sha256: str
+
+
+@dataclass(frozen=True)
+class CandidateOutcome:
+    status: str
+    date_failed: bool = False
+
+
+@dataclass(frozen=True)
+class BatchSummary:
+    total: int
+    downloaded: int
+    existing: int
+    failed: int
+    date_failed: int
+    unprocessed: int
 
 
 class RejectRedirects(urllib.request.HTTPRedirectHandler):
@@ -312,6 +329,7 @@ def download_sample(
     timeout: int = 120,
 ) -> DownloadResult:
     part = destination.with_suffix(destination.suffix + ".part")
+    _safe_unlink(part)
     digest = hashlib.sha256()
     byte_count = 0
     first_bytes = b""
@@ -344,9 +362,126 @@ def download_sample(
     except SmokeError:
         _safe_unlink(part)
         raise
+    except KeyboardInterrupt:
+        _safe_unlink(part)
+        raise
     except Exception:
         _safe_unlink(part)
         raise SmokeError("download-failed") from None
+
+
+def looks_like_existing_jpeg(path: Path) -> bool:
+    try:
+        if path.stat().st_size <= MIN_BYTES:
+            return False
+        with path.open("rb") as handle:
+            return handle.read(2) == b"\xff\xd8"
+    except OSError:
+        return False
+
+
+def download_batch_candidate(
+    url: str,
+    output_dir: Path,
+    *,
+    opener,
+    date_setter: Callable = apply_record_date,
+) -> CandidateOutcome:
+    destination = batch_destination(url, output_dir)
+    record_date = extract_record_date(url)
+    if looks_like_existing_jpeg(destination):
+        try:
+            date_ok = date_setter(destination, record_date)
+        except Exception:
+            date_ok = False
+        return CandidateOutcome("existing", date_failed=not date_ok)
+    try:
+        download_sample(opener, url, destination)
+    except SmokeError:
+        return CandidateOutcome("failed")
+    try:
+        date_ok = date_setter(destination, record_date)
+    except Exception:
+        date_ok = False
+    return CandidateOutcome("downloaded", date_failed=not date_ok)
+
+
+def download_batch(
+    urls: list[str],
+    output_dir: Path,
+    *,
+    opener=None,
+    sleep_fn: Callable = time.sleep,
+    date_setter: Callable = apply_record_date,
+    candidate_downloader: Callable | None = None,
+) -> BatchSummary:
+    ensure_build_is_ignored()
+    candidates = list(dict.fromkeys(urls))
+    candidate_downloader = candidate_downloader or download_batch_candidate
+    opener = opener or build_opener()
+    previous_umask = os.umask(0o077)
+    downloaded = 0
+    existing = 0
+    failed = 0
+    date_failed = 0
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        pending = candidates
+        for pass_index in range(3):
+            if not pending:
+                break
+            if pass_index > 0:
+                sleep_fn(2)
+            next_pending: list[str] = []
+            for index, url in enumerate(pending):
+                print(f"第 {pass_index + 1} 轮：{index + 1}/{len(pending)}")
+                try:
+                    outcome = candidate_downloader(
+                        url,
+                        output_dir,
+                        opener=opener,
+                        date_setter=date_setter,
+                    )
+                except KeyboardInterrupt:
+                    unprocessed = len(next_pending) + len(pending) - index
+                    summary = BatchSummary(
+                        len(candidates),
+                        downloaded,
+                        existing,
+                        failed,
+                        date_failed,
+                        unprocessed,
+                    )
+                    _print_batch_summary(summary, output_dir)
+                    return summary
+                if outcome.status == "downloaded":
+                    downloaded += 1
+                    date_failed += int(outcome.date_failed)
+                elif outcome.status == "existing":
+                    existing += 1
+                    date_failed += int(outcome.date_failed)
+                elif pass_index == 2:
+                    failed += 1
+                else:
+                    next_pending.append(url)
+            pending = next_pending
+        summary = BatchSummary(
+            len(candidates), downloaded, existing, failed, date_failed, 0
+        )
+        _print_batch_summary(summary, output_dir)
+        return summary
+    finally:
+        os.umask(previous_umask)
+
+
+def _print_batch_summary(summary: BatchSummary, output_dir: Path) -> None:
+    print(
+        "结果："
+        f"下载 {summary.downloaded}，已存在 {summary.existing}，"
+        f"失败 {summary.failed}，日期设置失败 {summary.date_failed}，"
+        f"未处理 {summary.unprocessed}"
+    )
+    print(f"输出目录：{output_dir}")
 
 
 def create_run_directory(parent: Path, timestamp: str | None = None) -> Path:
@@ -471,9 +606,15 @@ def run_batch(
     if not confirm_download(len(candidates), input_fn):
         print("已取消；没有下载照片。")
         return 0
-    if downloader is None:
-        raise SmokeError("batch-downloader-not-ready")
-    return downloader(candidates, output_dir)
+    downloader = downloader or download_batch
+    result = downloader(candidates, output_dir)
+    if isinstance(result, int):
+        return result
+    if result.failed == 0 and result.unprocessed == 0:
+        print("本轮候选下载完成。")
+        return 0
+    print("本轮候选尚未全部完成。")
+    return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
