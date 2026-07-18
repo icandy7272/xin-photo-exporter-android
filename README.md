@@ -8,7 +8,25 @@
 
 - 技术可行性已通过只读探测验证。
 - 技术路线经过 Review 后已精简为个人本地 Smoke MVP。
-- 尚未实现下载工具。
+- 已实现默认只读 dry-run，以及需要明确参数才会执行的三张样本下载。
+
+## Smoke 验证
+
+先启动 MuMuPlayer，在“鑫时光集家长版”中登录自己的账号并浏览照片列表，让 App 将当前照片信息加载到日志。然后在仓库根目录运行：
+
+```bash
+python3 tools/export_originals.py
+```
+
+该命令只检查 MuMu、目标 App 和候选原图数量，不创建目录、不下载照片。确认结果后，明确执行三张样本下载：
+
+```bash
+python3 tools/export_originals.py --execute
+```
+
+工具只下载前三个有效候选，输出到被 Git 忽略的 `build/direct-original-smoke/<时间戳>/`。它不会保存 logcat 或 URL 列表，也不会把 URL 写进文件名或终端输出。
+
+请在 macOS 中人工打开三个样本，检查内容归属、能否正常打开、尺寸和画质。照片像素与 EXIF 可能包含敏感信息，验证后请手动删除样本目录。
 
 ## 隐私原则
 
