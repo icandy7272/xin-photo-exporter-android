@@ -106,7 +106,7 @@ def _info_rows(payload: object) -> list[dict]:
     if isinstance(payload, list):
         return [row for row in payload if isinstance(row, dict)]
     if isinstance(payload, dict):
-        for key in ("devices", "data", "infos", "items"):
+        for key in ("return", "results", "devices", "data", "infos", "items"):
             if key in payload:
                 return _info_rows(payload[key])
         return [payload]
@@ -130,6 +130,7 @@ def discover_running_device(
         or row.get("isAndroidStarted") is True
         or row.get("running") is True
         or row.get("status") == "running"
+        or row.get("state") == "running"
     ]
     if not running:
         raise SmokeError("mumu-not-running")

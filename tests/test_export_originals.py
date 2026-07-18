@@ -95,6 +95,16 @@ class FakeRunner:
 class MuMuDiscoveryTests(unittest.TestCase):
     RUNNING = '[{"index":0,"is_android_started":true,"adb_port":16384}]'
 
+    def test_accepts_current_mumu_return_results_shape(self):
+        runner = FakeRunner(
+            '{"errcode":0,"return":{"count":1,"results":['
+            '{"index":0,"state":"running","adb_port":16384}]}}'
+        )
+        self.assertEqual(
+            export_originals.discover_running_device(runner).serial,
+            "127.0.0.1:16384",
+        )
+
     def test_discovers_one_running_instance_and_reads_pid_logcat(self):
         runner = FakeRunner(self.RUNNING)
         device = export_originals.discover_running_device(runner)
