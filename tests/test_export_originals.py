@@ -213,13 +213,32 @@ class FakeOpener:
 class DownloadTests(unittest.TestCase):
     JPEG = b"\xff\xd8" + b"x" * 2048
 
+    def test_selects_system_ca_when_framework_python_bundle_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            missing = Path(temp) / "python-cert.pem"
+            system = Path(temp) / "system-cert.pem"
+            system.write_text("certificate bundle")
+            self.assertEqual(
+                export_originals.select_ca_file(missing, system),
+                system,
+            )
+
     def test_opener_disables_proxies_and_rejects_redirects(self):
         sentinel = object()
         with mock.patch.object(
             export_originals.urllib.request, "build_opener", return_value=sentinel
         ) as builder:
             self.assertIs(export_originals.build_opener(), sentinel)
-        proxy_handler, redirect_handler = builder.call_args.args
+        proxy_handler = next(
+            handler
+            for handler in builder.call_args.args
+            if isinstance(handler, export_originals.urllib.request.ProxyHandler)
+        )
+        redirect_handler = next(
+            handler
+            for handler in builder.call_args.args
+            if isinstance(handler, export_originals.RejectRedirects)
+        )
         self.assertIsInstance(proxy_handler, export_originals.urllib.request.ProxyHandler)
         self.assertEqual(proxy_handler.proxies, {})
         self.assertIsInstance(redirect_handler, export_originals.RejectRedirects)

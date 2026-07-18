@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import ssl
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,6 +30,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MIN_BYTES = 1024
 MAX_BYTES = 50 * 1024 * 1024
 CHUNK_BYTES = 64 * 1024
+SYSTEM_CA_FILE = Path("/etc/ssl/cert.pem")
 
 
 class SmokeError(RuntimeError):
@@ -51,9 +53,19 @@ class RejectRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def select_ca_file(python_ca_file: Path, system_ca_file: Path = SYSTEM_CA_FILE) -> Path:
+    for candidate in (python_ca_file, system_ca_file):
+        if candidate.is_file():
+            return candidate
+    raise SmokeError("ca-bundle-not-found")
+
+
 def build_opener():
+    python_ca = Path(ssl.get_default_verify_paths().openssl_cafile)
+    context = ssl.create_default_context(cafile=str(select_ca_file(python_ca)))
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=context),
         RejectRedirects(),
     )
 
