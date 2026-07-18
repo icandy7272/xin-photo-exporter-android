@@ -6,4 +6,12 @@ build/
 *.png
 *.heic
 report.json
+feed.log
+urls.txt
+fails.txt
+*.urls
 
+# 含完整原图 URL 的敏感产物——严禁提交
+feed.log
+urls.txt
+fails.txt
