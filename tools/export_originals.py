@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 import urllib.parse
+import urllib.request
 
 
 CDN_HOST = "cdn-mctchildfoliocn.childfolio.net"
@@ -22,6 +26,9 @@ ADB = Path(
 )
 PACKAGE = "com.childfolio.family"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+MIN_BYTES = 1024
+MAX_BYTES = 50 * 1024 * 1024
+CHUNK_BYTES = 64 * 1024
 
 
 class SmokeError(RuntimeError):
@@ -31,6 +38,24 @@ class SmokeError(RuntimeError):
 @dataclass(frozen=True)
 class Device:
     serial: str
+
+
+@dataclass(frozen=True)
+class DownloadResult:
+    byte_count: int
+    sha256: str
+
+
+class RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def build_opener():
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        RejectRedirects(),
+    )
 
 
 def run_command(argv: list[str | Path]) -> subprocess.CompletedProcess[str]:
@@ -139,6 +164,127 @@ def read_current_logcat(
     return result.stdout
 
 
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def download_sample(
+    opener,
+    url: str,
+    destination: Path,
+    timeout: int = 120,
+) -> DownloadResult:
+    part = destination.with_suffix(destination.suffix + ".part")
+    digest = hashlib.sha256()
+    byte_count = 0
+    first_bytes = b""
+    request = urllib.request.Request(url, headers={"User-Agent": "xin-photo-smoke/1"})
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            if response.status != 200:
+                raise SmokeError("http-not-200")
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "image/jpeg":
+                raise SmokeError("wrong-content-type")
+            with part.open("xb") as output:
+                while True:
+                    chunk = response.read(CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    byte_count += len(chunk)
+                    if byte_count > MAX_BYTES:
+                        raise SmokeError("too-large")
+                    if len(first_bytes) < 2:
+                        first_bytes = (first_bytes + chunk)[:2]
+                    digest.update(chunk)
+                    output.write(chunk)
+        if byte_count <= MIN_BYTES:
+            raise SmokeError("too-small")
+        if first_bytes != b"\xff\xd8":
+            raise SmokeError("invalid-jpeg")
+        os.replace(part, destination)
+        return DownloadResult(byte_count=byte_count, sha256=digest.hexdigest())
+    except SmokeError:
+        _safe_unlink(part)
+        raise
+    except Exception:
+        _safe_unlink(part)
+        raise SmokeError("download-failed") from None
+
+
+def create_run_directory(parent: Path, timestamp: str | None = None) -> Path:
+    parent.mkdir(parents=True, exist_ok=True)
+    base = timestamp or datetime.now().strftime("%Y%m%d-%H%M%S")
+    suffix = 0
+    while True:
+        name = base if suffix == 0 else f"{base}-{suffix}"
+        candidate = parent / name
+        try:
+            candidate.mkdir(exist_ok=False)
+            return candidate
+        except FileExistsError:
+            suffix += 1
+
+
+def ensure_build_is_ignored(repository_root: Path = REPOSITORY_ROOT) -> None:
+    ignore_file = repository_root / ".gitignore"
+    try:
+        rules = {
+            line.strip()
+            for line in ignore_file.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+    except OSError:
+        raise SmokeError("build-not-ignored") from None
+    if "build/" not in rules and "/build/" not in rules:
+        raise SmokeError("build-not-ignored")
+
+
+def execute_samples(
+    samples: list[str],
+    output_parent: Path,
+    *,
+    opener=None,
+    timestamp: str | None = None,
+    require_ignore: bool = True,
+) -> int:
+    if len(samples) != 3:
+        raise SmokeError("sample-count-not-three")
+    if require_ignore:
+        ensure_build_is_ignored()
+    previous_umask = os.umask(0o077)
+    try:
+        run_directory = create_run_directory(output_parent, timestamp)
+        opener = opener or build_opener()
+        successes = 0
+        failures = 0
+        seen_hashes: set[str] = set()
+        print("提示：仅处理本人账号；样本像素与 EXIF 可能包含敏感信息。")
+        for ordinal, url in enumerate(samples, start=1):
+            destination = run_directory / f"sample-{ordinal:02d}.jpeg"
+            try:
+                result = download_sample(opener, url, destination)
+                duplicate = result.sha256 in seen_hashes
+                seen_hashes.add(result.sha256)
+                successes += 1
+                label = "（内容重复）" if duplicate else ""
+                print(
+                    f"样本 {ordinal}：成功，{result.byte_count} 字节，"
+                    f"SHA-256 {result.sha256}{label}"
+                )
+            except SmokeError as exc:
+                failures += 1
+                print(f"样本 {ordinal}：失败（{exc}）")
+        print(f"完成：成功 {successes}，失败 {failures}")
+        print(f"样本目录：{run_directory}")
+        return 0 if failures == 0 else 1
+    finally:
+        os.umask(previous_umask)
+
+
 def run_smoke(
     execute: bool = False,
     *,
@@ -158,8 +304,7 @@ def run_smoke(
     print(f"输出父目录：{destination}")
     if not execute:
         return 0
-    if downloader is None:
-        raise SmokeError("downloader-not-ready")
+    downloader = downloader or execute_samples
     return downloader(samples, destination)
 
 
