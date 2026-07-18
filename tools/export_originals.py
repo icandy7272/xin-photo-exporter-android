@@ -222,7 +222,7 @@ def read_current_logcat(
 
 def start_logcat_stream(
     device: Device,
-    pid: int,
+    _pid: int,
     popen: Callable = subprocess.Popen,
 ):
     try:
@@ -232,7 +232,6 @@ def start_logcat_stream(
                 "-s",
                 device.serial,
                 "logcat",
-                f"--pid={pid}",
                 "-v",
                 "brief",
             ],

@@ -473,7 +473,7 @@ class StreamingCollectorTests(unittest.TestCase):
 
         return factory
 
-    def test_collects_ordered_unique_candidates_and_cleans_up(self):
+    def test_collects_ordered_unique_candidates_without_pid_binding(self):
         host = export_originals.CDN_HOST
         first = f"https://{host}/moments/images/2026-06-04/a.jpeg"
         second = f"https://{host}/moments/images/2026-06-05/b.jpeg"
@@ -507,11 +507,11 @@ class StreamingCollectorTests(unittest.TestCase):
                 "-s",
                 "127.0.0.1:16384",
                 "logcat",
-                "--pid=2468",
                 "-v",
                 "brief",
             ],
         )
+        self.assertNotIn("--pid=2468", argv)
         self.assertFalse(any("https://" in value for value in argv))
         self.assertEqual(kwargs["text"], True)
         self.assertEqual(kwargs["errors"], "replace")
