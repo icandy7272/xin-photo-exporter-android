@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import date, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -319,6 +320,107 @@ class DownloadTests(unittest.TestCase):
             self.assertEqual(len(list(parent.rglob("*.jpeg"))), 3)
             self.assertNotIn("https://", stream.getvalue())
             self.assertFalse(any(url in stream.getvalue() for url in urls))
+
+
+class BatchPathTests(unittest.TestCase):
+    def test_extracts_record_date_and_builds_stable_destination(self):
+        url = (
+            f"https://{export_originals.CDN_HOST}/provider/1/moments/images/"
+            "2026-06-04/opaque.jpeg"
+        )
+        self.assertEqual(export_originals.extract_record_date(url), date(2026, 6, 4))
+        first = export_originals.batch_destination(url, Path("/tmp/out"))
+        second = export_originals.batch_destination(url, Path("/tmp/out"))
+        self.assertEqual(first, second)
+        self.assertRegex(first.name, r"^2026-06-04_[0-9a-f]{64}\.jpeg$")
+        self.assertNotIn("opaque", first.name)
+
+    def test_missing_or_invalid_date_uses_unknown_date(self):
+        missing = f"https://{export_originals.CDN_HOST}/provider/1/no-date/a.jpeg"
+        invalid = (
+            f"https://{export_originals.CDN_HOST}/provider/1/moments/images/"
+            "2026-02-30/b.jpeg"
+        )
+        self.assertIsNone(export_originals.extract_record_date(missing))
+        self.assertIsNone(export_originals.extract_record_date(invalid))
+        for url in (missing, invalid):
+            self.assertTrue(
+                export_originals.batch_destination(url, Path("/tmp")).name.startswith(
+                    "unknown-date_"
+                )
+            )
+
+    def test_different_urls_have_different_stable_paths(self):
+        host = export_originals.CDN_HOST
+        first = export_originals.batch_destination(
+            f"https://{host}/moments/images/2026-06-04/a.jpeg", Path("/tmp")
+        )
+        second = export_originals.batch_destination(
+            f"https://{host}/moments/images/2026-06-04/b.jpeg", Path("/tmp")
+        )
+        self.assertNotEqual(first, second)
+
+
+class BatchDateTests(unittest.TestCase):
+    def test_applies_local_noon_to_mtime_and_setfile(self):
+        calls = []
+
+        def runner(argv):
+            calls.append([str(value) for value in argv])
+            return completed(argv)
+
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "local.jpeg"
+            original = b"private-image"
+            destination.write_bytes(original)
+            with mock.patch.object(export_originals.os, "utime") as utime:
+                self.assertTrue(
+                    export_originals.apply_record_date(
+                        destination, date(2026, 6, 4), run_command=runner
+                    )
+                )
+            expected = datetime(2026, 6, 4, 12, 0, 0).astimezone().timestamp()
+            utime.assert_called_once_with(destination, (expected, expected))
+            self.assertEqual(
+                calls,
+                [[
+                    "/usr/bin/SetFile",
+                    "-d",
+                    "06/04/2026 12:00:00",
+                    "-m",
+                    "06/04/2026 12:00:00",
+                    str(destination),
+                ]],
+            )
+            self.assertEqual(destination.read_bytes(), original)
+            self.assertFalse(any("https://" in value for value in calls[0]))
+
+    def test_missing_date_is_noop_success(self):
+        with mock.patch.object(export_originals.os, "utime") as utime:
+            self.assertTrue(
+                export_originals.apply_record_date(Path("unused.jpeg"), None)
+            )
+        utime.assert_not_called()
+
+    def test_date_failures_are_non_destructive_and_return_false(self):
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "local.jpeg"
+            original = b"private-image"
+            destination.write_bytes(original)
+            runner = lambda argv: completed(argv, returncode=1)
+            self.assertFalse(
+                export_originals.apply_record_date(
+                    destination, date(2026, 6, 4), run_command=runner
+                )
+            )
+            self.assertEqual(destination.read_bytes(), original)
+            with mock.patch.object(export_originals.os, "utime", side_effect=OSError):
+                self.assertFalse(
+                    export_originals.apply_record_date(
+                        destination, date(2026, 6, 4), run_command=runner
+                    )
+                )
+            self.assertEqual(destination.read_bytes(), original)
 
 
 if __name__ == "__main__":

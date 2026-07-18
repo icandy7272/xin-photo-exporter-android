@@ -11,7 +11,7 @@ import re
 import ssl
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Callable
 import urllib.parse
@@ -31,6 +31,11 @@ MIN_BYTES = 1024
 MAX_BYTES = 50 * 1024 * 1024
 CHUNK_BYTES = 64 * 1024
 SYSTEM_CA_FILE = Path("/etc/ssl/cert.pem")
+SETFILE = Path("/usr/bin/SetFile")
+RECORD_DATE_RE = re.compile(
+    r"(?:^|/)moments/images/(\d{4}-\d{2}-\d{2})(?:/|$)"
+)
+BATCH_OUTPUT = REPOSITORY_ROOT / "build" / "originals"
 
 
 class SmokeError(RuntimeError):
@@ -107,6 +112,27 @@ def extract_urls(text: str) -> list[str]:
     return found
 
 
+def extract_record_date(url: str) -> date | None:
+    try:
+        path = urllib.parse.urlsplit(url).path
+    except ValueError:
+        return None
+    match = RECORD_DATE_RE.search(path)
+    if match is None:
+        return None
+    try:
+        return date.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+
+
+def batch_destination(url: str, output_dir: Path) -> Path:
+    record_date = extract_record_date(url)
+    prefix = record_date.isoformat() if record_date else "unknown-date"
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return output_dir / f"{prefix}_{digest}.jpeg"
+
+
 def select_samples(urls: list[str], count: int = 3) -> list[str]:
     samples = list(dict.fromkeys(urls))[:count]
     if len(samples) < count:
@@ -175,6 +201,33 @@ def read_current_logcat(
     if result.returncode != 0:
         raise SmokeError("logcat-failed")
     return result.stdout
+
+
+def apply_record_date(
+    destination: Path,
+    record_date: date | None,
+    run_command: Callable = run_command,
+) -> bool:
+    if record_date is None:
+        return True
+    local_noon = datetime(
+        record_date.year,
+        record_date.month,
+        record_date.day,
+        12,
+        0,
+        0,
+    ).astimezone()
+    timestamp = local_noon.timestamp()
+    formatted = record_date.strftime("%m/%d/%Y 12:00:00")
+    try:
+        os.utime(destination, (timestamp, timestamp))
+        result = run_command(
+            [SETFILE, "-d", formatted, "-m", formatted, destination]
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
 
 
 def _safe_unlink(path: Path) -> None:
