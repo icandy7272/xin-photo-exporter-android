@@ -551,7 +551,7 @@ class BatchCliTests(unittest.TestCase):
         with mock.patch.object(export_originals, "run_batch", return_value=0) as batch:
             with mock.patch.object(export_originals, "run_smoke") as smoke:
                 self.assertEqual(export_originals.main(["batch"]), 0)
-        batch.assert_called_once_with()
+        batch.assert_called_once_with(auto_scroll=False)
         smoke.assert_not_called()
 
     def test_exact_download_confirmation_only(self):
@@ -758,6 +758,250 @@ class BatchRetryTests(unittest.TestCase):
                     destination,
                 )
             self.assertFalse(destination.with_suffix(".jpeg.part").exists())
+
+
+class AutoScrollRunner:
+    """Scripted runner for auto-scroll: wm size, input swipe, logcat -d dumps."""
+
+    def __init__(self, dumps, size_output="Physical size: 1080x1920"):
+        self.dumps = list(dumps)
+        self.size_output = size_output
+        self.calls = []
+        self.swipes = 0
+
+    def __call__(self, argv):
+        argv = [str(value) for value in argv]
+        self.calls.append(argv)
+        if any("https://" in value for value in argv):
+            raise AssertionError("command arguments must not contain photo URLs")
+        if "wm" in argv and "size" in argv:
+            return completed(argv, self.size_output)
+        if "swipe" in argv:
+            self.swipes += 1
+            return completed(argv)
+        if "logcat" in argv:
+            text = self.dumps.pop(0) if self.dumps else ""
+            return completed(argv, text)
+        return completed(argv, returncode=1, stderr="unexpected-command")
+
+
+class ScreenSizeTests(unittest.TestCase):
+    def _size(self, output, returncode=0):
+        def runner(argv):
+            self.assertIn("wm", [str(value) for value in argv])
+            return completed(argv, output, returncode=returncode)
+
+        return export_originals.get_screen_size(
+            export_originals.Device("127.0.0.1:16384"), run_command=runner
+        )
+
+    def test_parses_physical_size(self):
+        self.assertEqual(self._size("Physical size: 1080x1920\n"), (1080, 1920))
+
+    def test_prefers_override_over_physical(self):
+        output = "Physical size: 1080x1920\nOverride size: 720x1280\n"
+        self.assertEqual(self._size(output), (720, 1280))
+
+    def test_failure_returncode_is_redacted(self):
+        with self.assertRaisesRegex(export_originals.SmokeError, "screen-size-failed"):
+            self._size("", returncode=1)
+
+    def test_missing_size_line_raises(self):
+        with self.assertRaisesRegex(export_originals.SmokeError, "screen-size-failed"):
+            self._size("no size here\n")
+
+
+class SwipeTests(unittest.TestCase):
+    def test_issues_scroll_swipe_within_bounds_without_urls(self):
+        calls = []
+
+        def runner(argv):
+            calls.append([str(value) for value in argv])
+            return completed(argv)
+
+        export_originals.swipe_scroll(
+            export_originals.Device("127.0.0.1:16384"), 1080, 1920, run_command=runner
+        )
+        self.assertEqual(
+            calls,
+            [[
+                str(export_originals.ADB),
+                "-s",
+                "127.0.0.1:16384",
+                "shell",
+                "input",
+                "swipe",
+                "540",
+                "1440",
+                "540",
+                "576",
+                str(export_originals.SWIPE_DURATION_MS),
+            ]],
+        )
+        _, _, _, _, _, _, x1, y1, x2, y2, _ = calls[0]
+        self.assertEqual(x1, x2)
+        self.assertGreater(int(y1), int(y2))
+        self.assertLess(int(y1), 1920)
+        self.assertGreater(int(y2), 0)
+
+    def test_swipe_failure_is_redacted(self):
+        runner = lambda argv: completed(argv, returncode=1)
+        with self.assertRaisesRegex(export_originals.SmokeError, "swipe-failed"):
+            export_originals.swipe_scroll(
+                export_originals.Device("serial"), 1080, 1920, run_command=runner
+            )
+
+
+class DumpLogcatTests(unittest.TestCase):
+    def test_extracts_unique_urls_without_pid_binding(self):
+        host = export_originals.CDN_HOST
+        first = f"https://{host}/moments/images/2026-06-04/a.jpeg"
+        second = f"https://{host}/moments/images/2026-06-05/b.jpeg"
+        calls = []
+
+        def runner(argv):
+            calls.append([str(value) for value in argv])
+            body = "\n".join(
+                [f"原图地址::{first}", f"原图地址::{first}", f"原图地址::{second}"]
+            )
+            return completed(argv, body)
+
+        urls = export_originals.dump_logcat_urls(
+            export_originals.Device("127.0.0.1:16384"), run_command=runner
+        )
+        self.assertEqual(urls, [first, second])
+        self.assertEqual(
+            calls[0],
+            [
+                str(export_originals.ADB),
+                "-s",
+                "127.0.0.1:16384",
+                "logcat",
+                "-d",
+                "-v",
+                "brief",
+            ],
+        )
+        self.assertNotIn("--pid=2468", calls[0])
+
+    def test_dump_failure_is_redacted(self):
+        runner = lambda argv: completed(argv, returncode=1)
+        with self.assertRaisesRegex(export_originals.SmokeError, "logcat-failed"):
+            export_originals.dump_logcat_urls(
+                export_originals.Device("serial"), run_command=runner
+            )
+
+
+class AutoScrollCollectTests(unittest.TestCase):
+    def setUp(self):
+        host = export_originals.CDN_HOST
+        self.a = f"https://{host}/moments/images/2026-06-04/a.jpeg"
+        self.b = f"https://{host}/moments/images/2026-06-05/b.jpeg"
+
+    def _line(self, url):
+        return f"I/PictureSelector: 原图地址::{url}\n"
+
+    def test_stops_after_idle_swipes_and_returns_ordered_unique(self):
+        text_a = self._line(self.a)
+        text_ab = self._line(self.a) + self._line(self.b)
+        runner = AutoScrollRunner([text_a, text_ab, text_ab, text_ab])
+        progress = []
+        urls = export_originals.collect_with_auto_scroll(
+            export_originals.Device("127.0.0.1:16384"),
+            run_command=runner,
+            sleep_fn=lambda seconds: None,
+            progress=progress.append,
+            max_idle_swipes=2,
+            settle_seconds=0,
+        )
+        self.assertEqual(urls, [self.a, self.b])
+        self.assertEqual(runner.swipes, 3)
+        self.assertTrue(all("https://" not in item for item in progress))
+        self.assertIn(
+            [
+                str(export_originals.ADB),
+                "-s",
+                "127.0.0.1:16384",
+                "shell",
+                "wm",
+                "size",
+            ],
+            runner.calls,
+        )
+
+    def test_new_candidates_reset_idle_counter(self):
+        text_a = self._line(self.a)
+        text_ab = self._line(self.a) + self._line(self.b)
+        runner = AutoScrollRunner([text_a, text_a, text_ab, text_ab, text_ab])
+        urls = export_originals.collect_with_auto_scroll(
+            export_originals.Device("serial"),
+            run_command=runner,
+            sleep_fn=lambda seconds: None,
+            progress=lambda value: None,
+            max_idle_swipes=2,
+            settle_seconds=0,
+        )
+        self.assertEqual(urls, [self.a, self.b])
+        self.assertEqual(runner.swipes, 4)
+
+    def test_keyboard_interrupt_returns_partial(self):
+        runner = AutoScrollRunner([self._line(self.a)])
+
+        def boom(seconds):
+            raise KeyboardInterrupt
+
+        urls = export_originals.collect_with_auto_scroll(
+            export_originals.Device("serial"),
+            run_command=runner,
+            sleep_fn=boom,
+            progress=lambda value: None,
+            max_idle_swipes=4,
+            settle_seconds=0,
+        )
+        self.assertEqual(urls, [self.a])
+        self.assertEqual(runner.swipes, 1)
+
+    def test_no_candidates_stops_and_returns_empty(self):
+        runner = AutoScrollRunner([])
+        urls = export_originals.collect_with_auto_scroll(
+            export_originals.Device("serial"),
+            run_command=runner,
+            sleep_fn=lambda seconds: None,
+            progress=lambda value: None,
+            max_idle_swipes=2,
+            settle_seconds=0,
+        )
+        self.assertEqual(urls, [])
+        self.assertEqual(runner.swipes, 2)
+
+
+class AutoScrollCliTests(unittest.TestCase):
+    def test_batch_auto_scroll_flag_dispatches(self):
+        with mock.patch.object(export_originals, "run_batch", return_value=0) as batch:
+            self.assertEqual(export_originals.main(["batch", "--auto-scroll"]), 0)
+        batch.assert_called_once_with(auto_scroll=True)
+
+    def test_batch_without_flag_defaults_manual(self):
+        with mock.patch.object(export_originals, "run_batch", return_value=0) as batch:
+            self.assertEqual(export_originals.main(["batch"]), 0)
+        batch.assert_called_once_with(auto_scroll=False)
+
+    def test_run_batch_auto_scroll_uses_auto_collector(self):
+        runner = FakeRunner(MuMuDiscoveryTests.RUNNING)
+        candidate = f"https://{export_originals.CDN_HOST}/a.jpeg"
+        with mock.patch.object(
+            export_originals, "collect_with_auto_scroll", return_value=[candidate]
+        ) as auto, mock.patch.object(
+            export_originals, "collect_streaming_urls"
+        ) as manual, redirect_stdout(io.StringIO()):
+            result = export_originals.run_batch(
+                run_command=runner,
+                input_fn=lambda prompt: "",
+                auto_scroll=True,
+            )
+        auto.assert_called_once()
+        manual.assert_not_called()
+        self.assertEqual(result, 0)
 
 
 if __name__ == "__main__":

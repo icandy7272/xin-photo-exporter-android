@@ -37,6 +37,12 @@ RECORD_DATE_RE = re.compile(
     r"(?:^|/)moments/images/(\d{4}-\d{2}-\d{2})(?:/|$)"
 )
 BATCH_OUTPUT = REPOSITORY_ROOT / "build" / "originals"
+WM_SIZE_RE = re.compile(r"(\d+)x(\d+)")
+SWIPE_DURATION_MS = 300
+SWIPE_START_FRACTION = 0.75
+SWIPE_END_FRACTION = 0.30
+DEFAULT_MAX_IDLE_SWIPES = 4
+DEFAULT_SETTLE_SECONDS = 1.5
 
 
 class SmokeError(RuntimeError):
@@ -284,6 +290,105 @@ def collect_streaming_urls(
         _stop_logcat_process(process)
     if not user_stopped:
         raise SmokeError("logcat-stream-failed")
+    return ordered
+
+
+def get_screen_size(
+    device: Device, run_command: Callable = run_command
+) -> tuple[int, int]:
+    result = run_command([ADB, "-s", device.serial, "shell", "wm", "size"])
+    if result.returncode != 0:
+        raise SmokeError("screen-size-failed")
+    override: tuple[int, int] | None = None
+    physical: tuple[int, int] | None = None
+    for line in result.stdout.splitlines():
+        match = WM_SIZE_RE.search(line)
+        if match is None:
+            continue
+        size = (int(match.group(1)), int(match.group(2)))
+        if "Override" in line:
+            override = size
+        elif "Physical" in line:
+            physical = size
+    chosen = override or physical
+    if chosen is None or chosen[0] <= 0 or chosen[1] <= 0:
+        raise SmokeError("screen-size-failed")
+    return chosen
+
+
+def swipe_scroll(
+    device: Device,
+    width: int,
+    height: int,
+    *,
+    run_command: Callable = run_command,
+    duration_ms: int = SWIPE_DURATION_MS,
+) -> None:
+    center_x = width // 2
+    y_start = int(height * SWIPE_START_FRACTION)
+    y_end = int(height * SWIPE_END_FRACTION)
+    result = run_command(
+        [
+            ADB,
+            "-s",
+            device.serial,
+            "shell",
+            "input",
+            "swipe",
+            str(center_x),
+            str(y_start),
+            str(center_x),
+            str(y_end),
+            str(duration_ms),
+        ]
+    )
+    if result.returncode != 0:
+        raise SmokeError("swipe-failed")
+
+
+def dump_logcat_urls(
+    device: Device, run_command: Callable = run_command
+) -> list[str]:
+    result = run_command(
+        [ADB, "-s", device.serial, "logcat", "-d", "-v", "brief"]
+    )
+    if result.returncode != 0:
+        raise SmokeError("logcat-failed")
+    return extract_urls(result.stdout)
+
+
+def collect_with_auto_scroll(
+    device: Device,
+    *,
+    run_command: Callable = run_command,
+    sleep_fn: Callable = time.sleep,
+    progress: Callable[[str], None] = print,
+    max_idle_swipes: int = DEFAULT_MAX_IDLE_SWIPES,
+    settle_seconds: float = DEFAULT_SETTLE_SECONDS,
+) -> list[str]:
+    width, height = get_screen_size(device, run_command=run_command)
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def merge() -> None:
+        for url in dump_logcat_urls(device, run_command=run_command):
+            if url not in seen:
+                seen.add(url)
+                ordered.append(url)
+
+    try:
+        merge()
+        progress(f"已发现唯一原图：{len(ordered)}")
+        idle = 0
+        while idle < max_idle_swipes:
+            before = len(ordered)
+            swipe_scroll(device, width, height, run_command=run_command)
+            sleep_fn(settle_seconds)
+            merge()
+            idle = 0 if len(ordered) > before else idle + 1
+            progress(f"已发现唯一原图：{len(ordered)}")
+    except KeyboardInterrupt:
+        pass
     return ordered
 
 
@@ -593,11 +698,19 @@ def run_batch(
     input_fn: Callable = input,
     downloader: Callable | None = None,
     output_dir: Path = BATCH_OUTPUT,
+    auto_scroll: bool = False,
 ) -> int:
     device = discover_running_device(run_command)
     pid = discover_app_pid(device, run_command)
-    print("批量采集已启动；请在 MuMu 中手动滚动，完成后按 Ctrl-C。")
-    candidates = collect_streaming_urls(device, pid, popen=popen)
+    if auto_scroll:
+        print(
+            "批量采集已启动（自动滚动）；连续无新候选会自动停止，"
+            "可随时按 Ctrl-C 提前结束。"
+        )
+        candidates = collect_with_auto_scroll(device, run_command=run_command)
+    else:
+        print("批量采集已启动；请在 MuMu 中手动滚动，完成后按 Ctrl-C。")
+        candidates = collect_streaming_urls(device, pid, popen=popen)
     print(f"采集结束：{len(candidates)} 个唯一原图候选。")
     if not candidates:
         print("没有候选，不创建输出目录。")
@@ -624,14 +737,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="明确下载且只下载三个原图样本",
     )
     subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("batch", help="手动滚动并流式采集批量原图")
+    batch_parser = subparsers.add_parser("batch", help="手动滚动并流式采集批量原图")
+    batch_parser.add_argument(
+        "--auto-scroll",
+        action="store_true",
+        help="自动滚动相册并在连续无新候选时停止",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "batch":
-        return run_batch()
+        return run_batch(auto_scroll=args.auto_scroll)
     return run_smoke(execute=args.execute)
 
 
