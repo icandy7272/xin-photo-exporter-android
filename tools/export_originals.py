@@ -41,8 +41,9 @@ WM_SIZE_RE = re.compile(r"(\d+)x(\d+)")
 SWIPE_DURATION_MS = 300
 SWIPE_START_FRACTION = 0.75
 SWIPE_END_FRACTION = 0.30
-DEFAULT_MAX_IDLE_SWIPES = 4
-DEFAULT_SETTLE_SECONDS = 1.5
+DEFAULT_MAX_STABLE_SCREENS = 2
+DEFAULT_MAX_SWIPES = 2000
+DEFAULT_SETTLE_SECONDS = 2.0
 
 
 class SmokeError(RuntimeError):
@@ -103,6 +104,14 @@ def run_command(argv: list[str | Path]) -> subprocess.CompletedProcess[str]:
         [str(value) for value in argv],
         capture_output=True,
         text=True,
+        check=False,
+    )
+
+
+def run_binary_command(argv: list[str | Path]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        [str(value) for value in argv],
+        capture_output=True,
         check=False,
     )
 
@@ -347,23 +356,46 @@ def swipe_scroll(
 
 
 def dump_logcat_urls(
-    device: Device, run_command: Callable = run_command
+    device: Device, run_binary: Callable = run_binary_command
 ) -> list[str]:
-    result = run_command(
+    result = run_binary(
         [ADB, "-s", device.serial, "logcat", "-d", "-v", "brief"]
     )
     if result.returncode != 0:
         raise SmokeError("logcat-failed")
-    return extract_urls(result.stdout)
+    stdout = result.stdout
+    text = (
+        stdout.decode("utf-8", "replace") if isinstance(stdout, bytes) else stdout
+    )
+    return extract_urls(text)
+
+
+def capture_screen_signature(
+    device: Device, run_binary: Callable = run_binary_command
+) -> bytes | None:
+    """Return a hash of the current screen, or None if capture failed.
+
+    The screenshot bytes only exist in memory long enough to hash; they are
+    never written to disk, printed, or transmitted. Only the opaque digest is
+    kept, purely to decide whether the list is still scrolling.
+    """
+    result = run_binary(
+        [ADB, "-s", device.serial, "exec-out", "screencap", "-p"]
+    )
+    if result.returncode != 0 or not result.stdout:
+        return None
+    return hashlib.sha256(result.stdout).digest()
 
 
 def collect_with_auto_scroll(
     device: Device,
     *,
     run_command: Callable = run_command,
+    run_binary: Callable = run_binary_command,
     sleep_fn: Callable = time.sleep,
     progress: Callable[[str], None] = print,
-    max_idle_swipes: int = DEFAULT_MAX_IDLE_SWIPES,
+    max_stable_screens: int = DEFAULT_MAX_STABLE_SCREENS,
+    max_swipes: int = DEFAULT_MAX_SWIPES,
     settle_seconds: float = DEFAULT_SETTLE_SECONDS,
 ) -> list[str]:
     width, height = get_screen_size(device, run_command=run_command)
@@ -371,7 +403,7 @@ def collect_with_auto_scroll(
     seen: set[str] = set()
 
     def merge() -> None:
-        for url in dump_logcat_urls(device, run_command=run_command):
+        for url in dump_logcat_urls(device, run_binary=run_binary):
             if url not in seen:
                 seen.add(url)
                 ordered.append(url)
@@ -379,13 +411,20 @@ def collect_with_auto_scroll(
     try:
         merge()
         progress(f"已发现唯一原图：{len(ordered)}")
-        idle = 0
-        while idle < max_idle_swipes:
-            before = len(ordered)
+        last_signature = capture_screen_signature(device, run_binary=run_binary)
+        stable = 0
+        swipes = 0
+        while stable < max_stable_screens and swipes < max_swipes:
             swipe_scroll(device, width, height, run_command=run_command)
             sleep_fn(settle_seconds)
             merge()
-            idle = 0 if len(ordered) > before else idle + 1
+            signature = capture_screen_signature(device, run_binary=run_binary)
+            if signature is not None and signature == last_signature:
+                stable += 1
+            else:
+                stable = 0
+            last_signature = signature
+            swipes += 1
             progress(f"已发现唯一原图：{len(ordered)}")
     except KeyboardInterrupt:
         pass

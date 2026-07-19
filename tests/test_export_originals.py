@@ -1,3 +1,4 @@
+import hashlib
 import io
 import os
 import subprocess
@@ -760,11 +761,10 @@ class BatchRetryTests(unittest.TestCase):
             self.assertFalse(destination.with_suffix(".jpeg.part").exists())
 
 
-class AutoScrollRunner:
-    """Scripted runner for auto-scroll: wm size, input swipe, logcat -d dumps."""
+class AutoUiRunner:
+    """run_command fake for auto-scroll UI ops: wm size + input swipe."""
 
-    def __init__(self, dumps, size_output="Physical size: 1080x1920"):
-        self.dumps = list(dumps)
+    def __init__(self, size_output="Physical size: 1080x1920"):
         self.size_output = size_output
         self.calls = []
         self.swipes = 0
@@ -779,10 +779,31 @@ class AutoScrollRunner:
         if "swipe" in argv:
             self.swipes += 1
             return completed(argv)
+        return completed(argv, returncode=1, stderr="unexpected-command")
+
+
+class AutoDataRunner:
+    """run_binary fake: logcat -d dumps (bytes) + screencap frames (bytes)."""
+
+    def __init__(self, dumps, frames, fail_capture=False):
+        self.dumps = list(dumps)
+        self.frames = list(frames)
+        self.fail_capture = fail_capture
+        self.calls = []
+
+    def __call__(self, argv):
+        argv = [str(value) for value in argv]
+        self.calls.append(argv)
         if "logcat" in argv:
             text = self.dumps.pop(0) if self.dumps else ""
-            return completed(argv, text)
-        return completed(argv, returncode=1, stderr="unexpected-command")
+            body = text.encode("utf-8") if isinstance(text, str) else text
+            return completed(argv, body)
+        if "screencap" in argv:
+            if self.fail_capture:
+                return completed(argv, b"", returncode=1)
+            frame = self.frames.pop(0) if self.frames else b""
+            return completed(argv, frame)
+        return completed(argv, b"", returncode=1)
 
 
 class ScreenSizeTests(unittest.TestCase):
@@ -853,21 +874,23 @@ class SwipeTests(unittest.TestCase):
 
 
 class DumpLogcatTests(unittest.TestCase):
-    def test_extracts_unique_urls_without_pid_binding(self):
+    def test_extracts_unique_urls_and_tolerates_invalid_bytes(self):
         host = export_originals.CDN_HOST
         first = f"https://{host}/moments/images/2026-06-04/a.jpeg"
         second = f"https://{host}/moments/images/2026-06-05/b.jpeg"
         calls = []
 
-        def runner(argv):
+        def run_binary(argv):
             calls.append([str(value) for value in argv])
             body = "\n".join(
                 [f"原图地址::{first}", f"原图地址::{first}", f"原图地址::{second}"]
-            )
+            ).encode("utf-8")
+            # Full device logcat carries other apps' non-UTF-8 bytes.
+            body += b"\n\xc0\xc1 other-app garbage \x80\xff\n"
             return completed(argv, body)
 
         urls = export_originals.dump_logcat_urls(
-            export_originals.Device("127.0.0.1:16384"), run_command=runner
+            export_originals.Device("127.0.0.1:16384"), run_binary=run_binary
         )
         self.assertEqual(urls, [first, second])
         self.assertEqual(
@@ -885,11 +908,48 @@ class DumpLogcatTests(unittest.TestCase):
         self.assertNotIn("--pid=2468", calls[0])
 
     def test_dump_failure_is_redacted(self):
-        runner = lambda argv: completed(argv, returncode=1)
+        run_binary = lambda argv: completed(argv, b"", returncode=1)
         with self.assertRaisesRegex(export_originals.SmokeError, "logcat-failed"):
             export_originals.dump_logcat_urls(
-                export_originals.Device("serial"), run_command=runner
+                export_originals.Device("serial"), run_binary=run_binary
             )
+
+
+class ScreenSignatureTests(unittest.TestCase):
+    def test_hashes_bytes_and_never_returns_raw_frame(self):
+        frame = b"\x89PNG-secret-photo-bytes"
+        captured = []
+
+        def run_binary(argv):
+            captured.append([str(value) for value in argv])
+            return completed(argv, frame)
+
+        signature = export_originals.capture_screen_signature(
+            export_originals.Device("127.0.0.1:16384"), run_binary=run_binary
+        )
+        self.assertEqual(signature, hashlib.sha256(frame).digest())
+        self.assertNotEqual(signature, frame)
+        self.assertEqual(
+            captured[0],
+            [
+                str(export_originals.ADB),
+                "-s",
+                "127.0.0.1:16384",
+                "exec-out",
+                "screencap",
+                "-p",
+            ],
+        )
+
+    def test_failure_or_empty_returns_none(self):
+        for result in (completed([], b"", returncode=1), completed([], b"")):
+            with self.subTest(result=result):
+                self.assertIsNone(
+                    export_originals.capture_screen_signature(
+                        export_originals.Device("serial"),
+                        run_binary=lambda argv: result,
+                    )
+                )
 
 
 class AutoScrollCollectTests(unittest.TestCase):
@@ -901,21 +961,43 @@ class AutoScrollCollectTests(unittest.TestCase):
     def _line(self, url):
         return f"I/PictureSelector: 原图地址::{url}\n"
 
-    def test_stops_after_idle_swipes_and_returns_ordered_unique(self):
-        text_a = self._line(self.a)
-        text_ab = self._line(self.a) + self._line(self.b)
-        runner = AutoScrollRunner([text_a, text_ab, text_ab, text_ab])
-        progress = []
+    def _collect(
+        self,
+        dumps,
+        frames,
+        *,
+        max_stable=2,
+        max_swipes=2000,
+        sleep_fn=None,
+        progress=None,
+        fail_capture=False,
+    ):
+        ui = AutoUiRunner()
+        data = AutoDataRunner(dumps, frames, fail_capture=fail_capture)
         urls = export_originals.collect_with_auto_scroll(
             export_originals.Device("127.0.0.1:16384"),
-            run_command=runner,
-            sleep_fn=lambda seconds: None,
-            progress=progress.append,
-            max_idle_swipes=2,
+            run_command=ui,
+            run_binary=data,
+            sleep_fn=sleep_fn or (lambda seconds: None),
+            progress=progress if progress is not None else (lambda value: None),
+            max_stable_screens=max_stable,
+            max_swipes=max_swipes,
             settle_seconds=0,
         )
+        return urls, ui, data
+
+    def test_stops_when_screen_goes_stable_and_collects_throughout(self):
+        text_a = self._line(self.a)
+        text_ab = self._line(self.a) + self._line(self.b)
+        # b only appears after an idle swipe: collection is not tied to stall.
+        dumps = [text_a, text_a, text_ab, text_ab, text_ab]
+        frames = [b"f1", b"f2", b"f3", b"f3", b"f3"]
+        progress = []
+        urls, ui, _ = self._collect(
+            dumps, frames, max_stable=2, progress=progress.append
+        )
         self.assertEqual(urls, [self.a, self.b])
-        self.assertEqual(runner.swipes, 3)
+        self.assertEqual(ui.swipes, 4)
         self.assertTrue(all("https://" not in item for item in progress))
         self.assertIn(
             [
@@ -926,53 +1008,44 @@ class AutoScrollCollectTests(unittest.TestCase):
                 "wm",
                 "size",
             ],
-            runner.calls,
+            ui.calls,
         )
 
-    def test_new_candidates_reset_idle_counter(self):
-        text_a = self._line(self.a)
-        text_ab = self._line(self.a) + self._line(self.b)
-        runner = AutoScrollRunner([text_a, text_a, text_ab, text_ab, text_ab])
-        urls = export_originals.collect_with_auto_scroll(
-            export_originals.Device("serial"),
-            run_command=runner,
-            sleep_fn=lambda seconds: None,
-            progress=lambda value: None,
-            max_idle_swipes=2,
-            settle_seconds=0,
-        )
-        self.assertEqual(urls, [self.a, self.b])
-        self.assertEqual(runner.swipes, 4)
+    def test_screen_change_resets_stable_counter(self):
+        dumps = [self._line(self.a)] * 6
+        frames = [b"f1", b"f1", b"f2", b"f1", b"f1", b"f1"]
+        urls, ui, _ = self._collect(dumps, frames, max_stable=2)
+        self.assertEqual(urls, [self.a])
+        self.assertEqual(ui.swipes, 5)
 
     def test_keyboard_interrupt_returns_partial(self):
-        runner = AutoScrollRunner([self._line(self.a)])
-
         def boom(seconds):
             raise KeyboardInterrupt
 
-        urls = export_originals.collect_with_auto_scroll(
-            export_originals.Device("serial"),
-            run_command=runner,
-            sleep_fn=boom,
-            progress=lambda value: None,
-            max_idle_swipes=4,
-            settle_seconds=0,
+        urls, ui, _ = self._collect(
+            [self._line(self.a)], [b"f1"], max_stable=2, sleep_fn=boom
         )
         self.assertEqual(urls, [self.a])
-        self.assertEqual(runner.swipes, 1)
+        self.assertEqual(ui.swipes, 1)
+
+    def test_never_stable_stops_at_max_swipes(self):
+        dumps = [self._line(self.a)] * 10
+        frames = [b"f1", b"f2", b"f3", b"f4"]
+        urls, ui, _ = self._collect(dumps, frames, max_stable=2, max_swipes=3)
+        self.assertEqual(urls, [self.a])
+        self.assertEqual(ui.swipes, 3)
+
+    def test_capture_failure_does_not_stop_early(self):
+        dumps = [self._line(self.a)] * 10
+        _, ui, _ = self._collect(
+            dumps, [], max_stable=2, max_swipes=3, fail_capture=True
+        )
+        self.assertEqual(ui.swipes, 3)
 
     def test_no_candidates_stops_and_returns_empty(self):
-        runner = AutoScrollRunner([])
-        urls = export_originals.collect_with_auto_scroll(
-            export_originals.Device("serial"),
-            run_command=runner,
-            sleep_fn=lambda seconds: None,
-            progress=lambda value: None,
-            max_idle_swipes=2,
-            settle_seconds=0,
-        )
+        urls, ui, _ = self._collect([], [b"f1", b"f1", b"f1"], max_stable=2)
         self.assertEqual(urls, [])
-        self.assertEqual(runner.swipes, 2)
+        self.assertEqual(ui.swipes, 2)
 
 
 class AutoScrollCliTests(unittest.TestCase):
