@@ -56,6 +56,12 @@ COUNTER_SEED = 2_360_360
 COUNTER_CEILING = 2_000_000_000
 DEFAULT_MAX_PAGES = 5000
 _PREF_STRING_RE = r'<string name="{key}">([^<]*)</string>'
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+# album_child_id is only set once the album is opened; childIds/paChildIds hold
+# the same id (as a JSON array) right after login, so fall back to them.
+_CHILD_ID_KEYS = ("album_child_id", "childIds", "paChildIds")
 
 VIDEO_EXTS = (".mp4", ".mov", ".m4v")
 VIDEO_MIN_BYTES = 1024
@@ -96,6 +102,17 @@ def extract_pref_string(prefs_xml: str, key: str) -> str | None:
     return match.group(1) or None
 
 
+def extract_child_id(prefs_xml: str) -> str | None:
+    """Find the child UUID from album_child_id / childIds / paChildIds."""
+    for key in _CHILD_ID_KEYS:
+        value = extract_pref_string(prefs_xml, key)
+        if value:
+            match = _UUID_RE.search(value)
+            if match:
+                return match.group(0)
+    return None
+
+
 def read_app_credentials(
     device: "eo.Device", run_command: Callable = eo.run_command
 ) -> tuple[str, str]:
@@ -112,7 +129,7 @@ def read_app_credentials(
     if result.returncode != 0:
         raise eo.SmokeError("prefs-read-failed")
     token = extract_pref_string(result.stdout, "accessToken")
-    child_id = extract_pref_string(result.stdout, "album_child_id")
+    child_id = extract_child_id(result.stdout)
     if not token or not child_id:
         raise eo.SmokeError("credentials-not-found")
     return token, child_id

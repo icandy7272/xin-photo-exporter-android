@@ -189,16 +189,31 @@ class CollectApiUrlsTests(unittest.TestCase):
         self.assertEqual(urls, [u])
 
 
+_UUID = "00000000-0000-4000-8000-000000000000"
+
+
 class ReadCredentialsTests(unittest.TestCase):
-    def test_reads_token_and_child_id(self):
+    def test_reads_token_and_album_child_id(self):
         xml = (
-            '<string name="accessToken">tok</string>'
-            '<string name="album_child_id">cid-uuid</string>'
+            f'<string name="accessToken">tok</string>'
+            f'<string name="album_child_id">{_UUID}</string>'
         )
         token, child = feed_api.read_app_credentials(
             eo.Device("127.0.0.1:1"), run_command=lambda argv: _completed(xml)
         )
-        self.assertEqual((token, child), ("tok", "cid-uuid"))
+        self.assertEqual((token, child), ("tok", _UUID))
+
+    def test_falls_back_to_child_ids_after_login(self):
+        # album_child_id empty right after login; childIds holds the id.
+        xml = (
+            f'<string name="accessToken">tok</string>'
+            f'<string name="album_child_id"></string>'
+            f'<string name="childIds">["{_UUID}"]</string>'
+        )
+        token, child = feed_api.read_app_credentials(
+            eo.Device("s"), run_command=lambda argv: _completed(xml)
+        )
+        self.assertEqual((token, child), ("tok", _UUID))
 
     def test_missing_child_id_raises(self):
         xml = '<string name="accessToken">tok</string>'
@@ -377,8 +392,8 @@ class WriteCaptionsTests(unittest.TestCase):
 class RunApiTests(unittest.TestCase):
     def _creds(self):
         return _completed(
-            '<string name="accessToken">tok</string>'
-            '<string name="album_child_id">cid</string>'
+            f'<string name="accessToken">tok</string>'
+            f'<string name="album_child_id">{_UUID}</string>'
         )
 
     def _run(self, page, *, input_answer="DOWNLOAD", include_videos=True, assume_yes=False, downloader=None, video_patch=None):
@@ -520,8 +535,8 @@ class FindStartCounterTests(unittest.TestCase):
                 rc = feed_api.run_api(
                     run_command=lambda argv: subprocess.CompletedProcess(
                         [], 0,
-                        '<string name="accessToken">t</string>'
-                        '<string name="album_child_id">c</string>', "",
+                        f'<string name="accessToken">t</string>'
+                        f'<string name="album_child_id">{_UUID}</string>', "",
                     ),
                     opener=object(),
                     assume_yes=True,
