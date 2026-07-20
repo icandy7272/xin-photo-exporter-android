@@ -92,6 +92,27 @@ python3 tools/export_originals.py batch --auto-scroll
 - 严格的「列表覆盖率」证明（逐项核对账号全量）属于后续迭代。
 - **可靠的全库导出**需绕开会崩的 UI、走后端 API；该接口需另行获取，属独立后续工作（见设计文档）。
 
+## 直连 API 全量导出（推荐，全库）
+
+绕开会崩的模拟器 UI，直接调后端 feed 接口分页拿全库原图：只拉 JSON、不渲染图片，低内存、能翻到最老的照片。接口经一次性 MITM 抓包逆向得到（见 [docs/mitm-capture-runbook.md](docs/mitm-capture-runbook.md)）。
+
+前置：MuMuPlayer 运行、「鑫时光集家长版」已登录本人账号。然后运行：
+
+```bash
+python3 tools/export_originals.py api
+```
+
+工具会：
+
+1. 从 App 的 `shared_prefs` 读取登录态（`accessToken`、`album_child_id`）；
+2. 翻页调用 `moment/FamilyMoment/v2/getPageMomentList`（`counter` 游标 + `hasMore`），采集每条 moment 的 `pictureURLs` 原图；终端只显示唯一候选数量；
+3. `hasMore=false` 到底自动停止，也可随时 `Ctrl-C` 提前停并保留已采集部分；
+4. 与批量模式相同的 `DOWNLOAD` 确认，下载到 `build/originals/`（文件名为 日期+哈希，按记录日期整理）。
+
+若首页为空（游标语义变化），用 `--counter <值>` 指定起始游标（默认从最新开始）。
+
+隐私：登录 token 只在运行内存中用于调用**本人账号**接口，**绝不打印、不写日志、不进 Git**；只取 `pictureURLs`，不碰头像/logo。
+
 ## 隐私原则
 
 - 完整原图 URL 只在运行内存中短暂存在。

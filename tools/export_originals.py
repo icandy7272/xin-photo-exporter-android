@@ -782,13 +782,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="自动滚动相册并在连续无新候选时停止",
     )
+    api_parser = subparsers.add_parser("api", help="直连后端 API 分页导出全部原图")
+    api_parser.add_argument(
+        "--counter",
+        type=int,
+        default=None,
+        help="起始分页游标（默认从最新开始）",
+    )
     return parser
+
+
+def _run_api(counter: int | None) -> int:
+    try:
+        from tools.feed_api import DEFAULT_INITIAL_COUNTER, run_api
+    except ImportError:
+        from feed_api import DEFAULT_INITIAL_COUNTER, run_api
+    return run_api(initial_counter=counter or DEFAULT_INITIAL_COUNTER)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "batch":
         return run_batch(auto_scroll=args.auto_scroll)
+    if args.command == "api":
+        return _run_api(args.counter)
     return run_smoke(execute=args.execute)
 
 
