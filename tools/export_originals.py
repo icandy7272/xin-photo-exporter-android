@@ -31,6 +31,10 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MIN_BYTES = 1024
 MAX_BYTES = 50 * 1024 * 1024
 CHUNK_BYTES = 64 * 1024
+# Content photos are jpeg/jpg or png (both seen on the CDN, no query).
+IMAGE_EXTS = (".jpeg", ".jpg", ".png")
+ALLOWED_IMAGE_TYPES = ("image/jpeg", "image/png")
+IMAGE_MAGIC = (b"\xff\xd8", b"\x89P")  # JPEG, PNG
 SYSTEM_CA_FILE = Path("/etc/ssl/cert.pem")
 SETFILE = Path("/usr/bin/SetFile")
 RECORD_DATE_RE = re.compile(
@@ -128,7 +132,7 @@ def validate_original_url(raw: str) -> str | None:
         return None
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         return None
-    if not parsed.path.endswith((".jpeg", ".jpg")):
+    if not parsed.path.endswith(IMAGE_EXTS):
         return None
     return raw
 
@@ -162,7 +166,8 @@ def batch_destination(url: str, output_dir: Path) -> Path:
     record_date = extract_record_date(url)
     prefix = record_date.isoformat() if record_date else "unknown-date"
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
-    return output_dir / f"{prefix}_{digest}.jpeg"
+    ext = ".png" if url.split("?", 1)[0].lower().endswith(".png") else ".jpeg"
+    return output_dir / f"{prefix}_{digest}{ext}"
 
 
 def select_samples(urls: list[str], count: int = 3) -> list[str]:
@@ -482,7 +487,7 @@ def download_sample(
             if response.status != 200:
                 raise SmokeError("http-not-200")
             content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-            if content_type != "image/jpeg":
+            if content_type not in ALLOWED_IMAGE_TYPES:
                 raise SmokeError("wrong-content-type")
             with part.open("xb") as output:
                 while True:
@@ -498,8 +503,8 @@ def download_sample(
                     output.write(chunk)
         if byte_count <= MIN_BYTES:
             raise SmokeError("too-small")
-        if first_bytes != b"\xff\xd8":
-            raise SmokeError("invalid-jpeg")
+        if first_bytes not in IMAGE_MAGIC:
+            raise SmokeError("invalid-image")
         os.replace(part, destination)
         return DownloadResult(byte_count=byte_count, sha256=digest.hexdigest())
     except SmokeError:
@@ -513,12 +518,12 @@ def download_sample(
         raise SmokeError("download-failed") from None
 
 
-def looks_like_existing_jpeg(path: Path) -> bool:
+def looks_like_existing_image(path: Path) -> bool:
     try:
         if path.stat().st_size <= MIN_BYTES:
             return False
         with path.open("rb") as handle:
-            return handle.read(2) == b"\xff\xd8"
+            return handle.read(2) in IMAGE_MAGIC
     except OSError:
         return False
 
@@ -532,7 +537,7 @@ def download_batch_candidate(
 ) -> CandidateOutcome:
     destination = batch_destination(url, output_dir)
     record_date = extract_record_date(url)
-    if looks_like_existing_jpeg(destination):
+    if looks_like_existing_image(destination):
         try:
             date_ok = date_setter(destination, record_date)
         except Exception:

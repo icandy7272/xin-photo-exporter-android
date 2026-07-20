@@ -13,7 +13,7 @@ from tools import export_originals
 
 
 class UrlSelectionTests(unittest.TestCase):
-    def test_extracts_only_original_https_cdn_jpegs_in_first_seen_order(self):
+    def test_extracts_only_original_https_cdn_images_in_first_seen_order(self):
         host = export_originals.CDN_HOST
         text = "\n".join(
             [
@@ -23,7 +23,9 @@ class UrlSelectionTests(unittest.TestCase):
                 f"原图地址::https://{host}/folder/a%20b.jpeg",
                 "原图地址::https://evil.example/a.jpeg",
                 f"原图地址::http://{host}/plain.jpeg",
-                f"原图地址::https://{host}/not-a-photo.png",
+                f"原图地址::https://{host}/b.jpg",
+                f"原图地址::https://{host}/c.png",
+                f"原图地址::https://{host}/not-an-image.gif",
             ]
         )
         self.assertEqual(
@@ -31,6 +33,8 @@ class UrlSelectionTests(unittest.TestCase):
             [
                 f"https://{host}/a.jpeg",
                 f"https://{host}/folder/a%20b.jpeg",
+                f"https://{host}/b.jpg",
+                f"https://{host}/c.png",
             ],
         )
 
@@ -256,6 +260,27 @@ class DownloadTests(unittest.TestCase):
             self.assertFalse(destination.with_suffix(".jpeg.part").exists())
             self.assertEqual(result.byte_count, len(self.JPEG))
             self.assertEqual(len(result.sha256), 64)
+
+    def test_valid_png_streams_through(self):
+        png = b"\x89P" + b"x" * 2048
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "sample.png"
+            opener = FakeOpener([FakeResponse(png, content_type="image/png")])
+            result = export_originals.download_sample(
+                opener, "https://example.invalid/a.png", destination
+            )
+            self.assertEqual(destination.read_bytes(), png)
+            self.assertEqual(result.byte_count, len(png))
+
+    def test_png_url_gets_png_destination(self):
+        url = f"https://{export_originals.CDN_HOST}/provider/1/moments/images/2026-04-17/a.png"
+        self.assertTrue(
+            export_originals.batch_destination(url, Path("/tmp/out")).name.endswith(".png")
+        )
+        jpg = f"https://{export_originals.CDN_HOST}/provider/1/moments/images/2026-04-17/a.jpg"
+        self.assertTrue(
+            export_originals.batch_destination(jpg, Path("/tmp/out")).name.endswith(".jpeg")
+        )
 
     def test_failures_leave_no_complete_or_part_file(self):
         cases = [
@@ -664,12 +689,12 @@ class BatchDownloadTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), self.JPEG)
             self.assertFalse(stale.exists())
 
-    def test_too_small_or_non_soi_existing_is_not_valid(self):
+    def test_too_small_or_unknown_magic_existing_is_not_valid(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "candidate.jpeg"
             for body in (b"\xff\xd8short", b"NO" + b"x" * 2048):
                 path.write_bytes(body)
-                self.assertFalse(export_originals.looks_like_existing_jpeg(path))
+                self.assertFalse(export_originals.looks_like_existing_image(path))
 
 
 class BatchRetryTests(unittest.TestCase):

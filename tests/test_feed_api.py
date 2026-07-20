@@ -86,18 +86,22 @@ class ExtractMomentsTests(unittest.TestCase):
         self.assertEqual(rec.picture_urls, (_pic("2024-01-02", "a"), _pic("2024-01-02", "b")))
         self.assertEqual(rec.video_url, _vid("2024-01-02", "v"))
 
-    def test_accepts_both_jpeg_and_jpg(self):
+    def test_accepts_jpeg_jpg_and_png(self):
         jpg = f"{CDN}/provider/1/moments/images/2024-01-02/abc.jpg"
-        payload = _payload([_moment(momentId="m1", pictureURLs=[_pic("2024-01-02", "a"), jpg])])
+        png = f"{CDN}/provider/1/moments/images/2024-01-02/abc.png"
+        payload = _payload(
+            [_moment(momentId="m1", pictureURLs=[_pic("2024-01-02", "a"), jpg, png])]
+        )
         records = feed_api.extract_moments(payload)
-        self.assertEqual(records[0].picture_urls, (_pic("2024-01-02", "a"), jpg))
+        self.assertEqual(records[0].picture_urls, (_pic("2024-01-02", "a"), jpg, png))
 
     def test_ignores_avatars_and_invalid_media(self):
         payload = _payload(
             [
                 _moment(
                     momentId="m2",
-                    pictureURLs=[_pic("2024-01-02", "a"), f"{CDN}/a/b.png"],
+                    # second URL has a query string -> rejected as a resized variant
+                    pictureURLs=[_pic("2024-01-02", "a"), f"{CDN}/a/b.jpeg?x-oss-process=resize"],
                     videoUrl=_pic("2024-01-02", "a"),  # jpeg, not a video
                     logo=f"{CDN}/logo.jpeg",
                     childList=[{"faceUrl": f"{CDN}/face.jpeg"}],
