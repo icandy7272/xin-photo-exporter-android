@@ -397,6 +397,7 @@ class RunApiTests(unittest.TestCase):
                     downloader=downloader,
                     include_videos=include_videos,
                     assume_yes=assume_yes,
+                    initial_counter=feed_api.COUNTER_SEED,
                 )
         return rc, wm, wc, dv
 
@@ -473,6 +474,63 @@ class RunApiTests(unittest.TestCase):
         self.assertEqual(rc, 1)
 
 
+class FindStartCounterTests(unittest.TestCase):
+    def test_finds_largest_counter_with_data(self):
+        boundary = 2_392_800
+        with redirect_stdout(io.StringIO()):
+            got = feed_api.find_start_counter(
+                lambda c: c <= boundary, seed=2_360_360, ceiling=2_000_000_000
+            )
+        self.assertEqual(got, boundary)
+
+    def test_returns_none_when_seed_empty(self):
+        with redirect_stdout(io.StringIO()):
+            got = feed_api.find_start_counter(lambda c: False, seed=100, ceiling=200)
+        self.assertIsNone(got)
+
+    def test_seed_itself_is_the_boundary(self):
+        with redirect_stdout(io.StringIO()):
+            got = feed_api.find_start_counter(
+                lambda c: c <= 2_360_360, seed=2_360_360, ceiling=9_000_000
+            )
+        self.assertEqual(got, 2_360_360)
+
+    def test_run_api_auto_discovers_counter(self):
+        # No initial_counter: run_api should binary-search then paginate.
+        boundary = 2_400_000
+        page = _payload([_moment(momentId="m1", pictureURLs=[_pic("2024-01-02", "a")])])
+        empty = _payload([])
+
+        def fake_fetch(opener, token, child_id, counter, timeout=30):
+            return page if counter <= boundary else empty
+
+        got = {}
+
+        def fake_downloader(urls, out):
+            got["urls"] = urls
+            return eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0)
+
+        with mock.patch.object(eo, "discover_running_device", return_value=eo.Device("s")), \
+                mock.patch.object(feed_api, "fetch_moment_page", side_effect=fake_fetch), \
+                mock.patch.object(eo, "ensure_build_is_ignored"), \
+                mock.patch.object(feed_api, "write_manifest", return_value=1), \
+                mock.patch.object(feed_api, "write_captions", return_value=1), \
+                mock.patch.object(feed_api, "download_videos", return_value=feed_api.VideoSummary(0, 0, 0, 0)):
+            with redirect_stdout(io.StringIO()):
+                rc = feed_api.run_api(
+                    run_command=lambda argv: subprocess.CompletedProcess(
+                        [], 0,
+                        '<string name="accessToken">t</string>'
+                        '<string name="album_child_id">c</string>', "",
+                    ),
+                    opener=object(),
+                    assume_yes=True,
+                    downloader=fake_downloader,
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(got["urls"], [_pic("2024-01-02", "a")])
+
+
 class CliDispatchTests(unittest.TestCase):
     def test_api_dispatches_with_counter_and_videos(self):
         with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
@@ -486,18 +544,14 @@ class CliDispatchTests(unittest.TestCase):
         with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
             eo.main(["api", "--no-videos"])
         run_api.assert_called_once_with(
-            initial_counter=feed_api.DEFAULT_INITIAL_COUNTER,
-            include_videos=False,
-            assume_yes=False,
+            initial_counter=None, include_videos=False, assume_yes=False
         )
 
     def test_api_yes_flag(self):
         with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
             eo.main(["api", "--yes"])
         run_api.assert_called_once_with(
-            initial_counter=feed_api.DEFAULT_INITIAL_COUNTER,
-            include_videos=True,
-            assume_yes=True,
+            initial_counter=None, include_videos=True, assume_yes=True
         )
 
 

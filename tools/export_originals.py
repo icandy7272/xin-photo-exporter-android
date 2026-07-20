@@ -789,7 +789,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--counter",
         type=int,
         default=None,
-        help="起始分页游标（默认从最新开始）",
+        help="起始分页游标（不填则二分自动定位当前最新）",
     )
     api_parser.add_argument(
         "--no-videos",
@@ -806,11 +806,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _run_api(counter: int | None, include_videos: bool, assume_yes: bool) -> int:
     try:
-        from tools.feed_api import DEFAULT_INITIAL_COUNTER, run_api
+        from tools.feed_api import run_api
     except ImportError:
-        from feed_api import DEFAULT_INITIAL_COUNTER, run_api
+        from feed_api import run_api
     return run_api(
-        initial_counter=counter or DEFAULT_INITIAL_COUNTER,
+        initial_counter=counter,
         include_videos=include_videos,
         assume_yes=assume_yes,
     )

@@ -47,9 +47,13 @@ FEED_PATH = "/moment/FamilyMoment/v2/getPageMomentList"
 API_CLIENT = "fa_app"
 API_LANG = "zh-Hans"
 API_USER_AGENT = "okhttp/3.14.9"
-# Cursor is an internal sequence (~2.36M when observed); a large start returns
-# newest. Kept within int32 in case the backend stores it as a Java int.
-DEFAULT_INITIAL_COUNTER = 2_000_000_000
+# The feed pages by a `counter` cursor that grows over time (higher = newer).
+# Empirically the API returns data only up to just above the newest post; higher
+# counters return an empty page. So the start counter is found dynamically
+# (find_start_counter): binary-search between COUNTER_SEED (a value known to sit
+# inside the populated range, ~2026-04) and COUNTER_CEILING (known empty).
+COUNTER_SEED = 2_360_360
+COUNTER_CEILING = 2_000_000_000
 DEFAULT_MAX_PAGES = 5000
 _PREF_STRING_RE = r'<string name="{key}">([^<]*)</string>'
 
@@ -180,7 +184,7 @@ def collect_moments(
     post_page: Callable[[str, int], object],
     child_id: str,
     *,
-    initial_counter: int = DEFAULT_INITIAL_COUNTER,
+    initial_counter: int = COUNTER_SEED,
     max_pages: int = DEFAULT_MAX_PAGES,
     progress: Callable[[str], None] = print,
 ) -> list[MomentRecord]:
@@ -230,7 +234,7 @@ def collect_api_urls(
     post_page: Callable[[str, int], object],
     child_id: str,
     *,
-    initial_counter: int = DEFAULT_INITIAL_COUNTER,
+    initial_counter: int = COUNTER_SEED,
     max_pages: int = DEFAULT_MAX_PAGES,
     progress: Callable[[str], None] = print,
 ) -> list[str]:
@@ -244,6 +248,35 @@ def collect_api_urls(
             progress=progress,
         )
     )
+
+
+def find_start_counter(
+    page_has_data: Callable[[int], bool],
+    *,
+    seed: int = COUNTER_SEED,
+    ceiling: int = COUNTER_CEILING,
+    progress: Callable[[str], None] = print,
+) -> int | None:
+    """Binary-search the largest counter that still returns moments.
+
+    The feed returns data only up to just above the newest post; higher
+    counters return an empty page. ``page_has_data`` is monotonic (True on
+    ``[oldest, newest]``, False above), so a binary search over
+    ``[seed, ceiling]`` finds the newest usable counter. ``seed`` must sit
+    inside the populated range. Returns None if even the seed is empty.
+    ``page_has_data`` is injected so the search is pure and testable.
+    """
+    if not page_has_data(seed):
+        return None
+    low, high = seed, ceiling
+    while high - low > 1:
+        mid = (low + high) // 2
+        if page_has_data(mid):
+            low = mid
+        else:
+            high = mid
+    progress(f"最新游标：{low}")
+    return low
 
 
 def fetch_moment_page(
@@ -456,7 +489,7 @@ def run_api(
     video_output_dir: Path = VIDEO_OUTPUT,
     include_videos: bool = True,
     assume_yes: bool = False,
-    initial_counter: int = DEFAULT_INITIAL_COUNTER,
+    initial_counter: int | None = None,
 ) -> int:
     """Collect the whole feed, save post text, then confirm and download."""
     try:
@@ -467,6 +500,18 @@ def run_api(
         def post_page(cid: str, counter: int) -> object:
             return fetch_moment_page(opener, token, cid, counter)
 
+        if initial_counter is None:
+            print("定位最新游标中（二分探测）…")
+
+            def has_data(counter: int) -> bool:
+                payload = post_page(child_id, counter)
+                data = payload.get("data") if isinstance(payload, dict) else None
+                moments = data.get("momentList") if isinstance(data, dict) else None
+                return bool(moments)
+
+            initial_counter = find_start_counter(has_data)
+            if initial_counter is None:
+                raise eo.SmokeError("counter-seed-empty")
         print("直连 API 采集中（翻页拉取，不经模拟器渲染）…")
         records = collect_moments(post_page, child_id, initial_counter=initial_counter)
         photo_urls = unique_picture_urls(records)
