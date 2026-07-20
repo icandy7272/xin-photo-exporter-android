@@ -1,8 +1,10 @@
 import io
 import json
 import subprocess
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 from tools import export_originals as eo
@@ -14,6 +16,14 @@ CDN = "https://cdn-mctchildfoliocn.childfolio.net"
 
 def _pic(date: str, name: str) -> str:
     return f"{CDN}/provider/1/moments/images/{date}/{name}.jpeg"
+
+
+def _vid(date: str, name: str) -> str:
+    return f"{CDN}/provider/1/moments/videos/{date}/{name}.mp4"
+
+
+def _moment(**kwargs) -> dict:
+    return kwargs
 
 
 def _payload(moments, *, has_more=False, counter=0):
@@ -41,110 +51,142 @@ class ExtractPrefStringTests(unittest.TestCase):
         self.assertIsNone(feed_api.extract_pref_string(xml, "album_child_id"))
 
 
-class ExtractPictureUrlsTests(unittest.TestCase):
-    def test_pulls_and_dedupes_across_moments(self):
+class ValidateVideoUrlTests(unittest.TestCase):
+    def test_accepts_cdn_mp4(self):
+        u = _vid("2024-01-02", "v")
+        self.assertEqual(feed_api.validate_video_url(u), u)
+
+    def test_rejects_non_video_ext(self):
+        self.assertIsNone(feed_api.validate_video_url(_pic("2024-01-02", "a")))
+
+    def test_rejects_wrong_host_or_scheme(self):
+        self.assertIsNone(feed_api.validate_video_url("https://evil.example/x.mp4"))
+        self.assertIsNone(feed_api.validate_video_url(f"http://cdn-mctchildfoliocn.childfolio.net/x.mp4"))
+
+
+class ExtractMomentsTests(unittest.TestCase):
+    def test_extracts_text_photos_and_video(self):
+        payload = _payload(
+            [
+                _moment(
+                    momentId="m1",
+                    publishedTime="2024-01-02 10:00:00",
+                    momentCaption="第一天上学",
+                    pictureURLs=[_pic("2024-01-02", "a"), _pic("2024-01-02", "b")],
+                    videoUrl=_vid("2024-01-02", "v"),
+                )
+            ]
+        )
+        records = feed_api.extract_moments(payload)
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec.moment_id, "m1")
+        self.assertEqual(rec.published_time, "2024-01-02 10:00:00")
+        self.assertEqual(rec.caption, "第一天上学")
+        self.assertEqual(rec.picture_urls, (_pic("2024-01-02", "a"), _pic("2024-01-02", "b")))
+        self.assertEqual(rec.video_url, _vid("2024-01-02", "v"))
+
+    def test_ignores_avatars_and_invalid_media(self):
+        payload = _payload(
+            [
+                _moment(
+                    momentId="m2",
+                    pictureURLs=[_pic("2024-01-02", "a"), f"{CDN}/a/b.png"],
+                    videoUrl=_pic("2024-01-02", "a"),  # jpeg, not a video
+                    logo=f"{CDN}/logo.jpeg",
+                    childList=[{"faceUrl": f"{CDN}/face.jpeg"}],
+                )
+            ]
+        )
+        rec = feed_api.extract_moments(payload)[0]
+        self.assertEqual(rec.picture_urls, (_pic("2024-01-02", "a"),))
+        self.assertIsNone(rec.video_url)
+
+    def test_missing_fields_default_empty(self):
+        rec = feed_api.extract_moments(_payload([{}]))[0]
+        self.assertEqual(rec.moment_id, "")
+        self.assertEqual(rec.caption, "")
+        self.assertEqual(rec.picture_urls, ())
+        self.assertIsNone(rec.video_url)
+
+    def test_handles_malformed(self):
+        self.assertEqual(feed_api.extract_moments(None), [])
+        self.assertEqual(feed_api.extract_moments({}), [])
+        self.assertEqual(feed_api.extract_moments({"data": {"momentList": "x"}}), [])
+
+
+class UniquePictureUrlsTests(unittest.TestCase):
+    def test_dedupes_preserving_order(self):
         u1, u2 = _pic("2024-01-02", "a"), _pic("2024-01-03", "b")
-        payload = _payload([{"pictureURLs": [u1, u2]}, {"pictureURLs": [u2]}])
-        self.assertEqual(feed_api.extract_picture_urls(payload), [u1, u2])
-
-    def test_ignores_avatars_logos_and_video(self):
-        payload = _payload(
-            [
-                {
-                    "pictureURLs": [_pic("2024-01-02", "a")],
-                    "logo": f"{CDN}/provider/1/logo.jpeg",
-                    "videoUrl": f"{CDN}/x.mp4",
-                    "childList": [{"faceUrl": f"{CDN}/face.jpeg"}],
-                }
-            ]
-        )
-        self.assertEqual(feed_api.extract_picture_urls(payload), [_pic("2024-01-02", "a")])
-
-    def test_rejects_invalid_urls(self):
-        payload = _payload(
-            [
-                {
-                    "pictureURLs": [
-                        f"{CDN}/a/b.png",  # not jpeg
-                        "http://evil.example/x.jpeg",  # wrong host + scheme
-                        f"{CDN}/a/b.jpeg?x-oss-process=resize",  # has query
-                        12345,  # not a string
-                    ]
-                }
-            ]
-        )
-        self.assertEqual(feed_api.extract_picture_urls(payload), [])
-
-    def test_handles_missing_or_malformed(self):
-        self.assertEqual(feed_api.extract_picture_urls(None), [])
-        self.assertEqual(feed_api.extract_picture_urls({}), [])
-        self.assertEqual(feed_api.extract_picture_urls({"data": {}}), [])
-        self.assertEqual(feed_api.extract_picture_urls({"data": {"momentList": "x"}}), [])
+        records = [
+            feed_api.MomentRecord("m1", "", "", (u1, u2), None),
+            feed_api.MomentRecord("m2", "", "", (u2,), None),
+        ]
+        self.assertEqual(feed_api.unique_picture_urls(records), [u1, u2])
 
 
-class CollectApiUrlsTests(unittest.TestCase):
-    def test_paginates_until_no_more(self):
+class CollectMomentsTests(unittest.TestCase):
+    def test_paginates_and_dedupes_by_moment_id(self):
         pages = {
-            100: _payload([{"pictureURLs": [_pic("2024-01-02", "a")]}], has_more=True, counter=90),
-            90: _payload([{"pictureURLs": [_pic("2024-01-01", "b")]}], has_more=True, counter=80),
-            80: _payload([{"pictureURLs": [_pic("2023-12-31", "c")]}], has_more=False),
+            100: _payload(
+                [_moment(momentId="m1", pictureURLs=[_pic("2024-01-02", "a")])],
+                has_more=True,
+                counter=90,
+            ),
+            90: _payload(
+                [_moment(momentId="m1", pictureURLs=[_pic("2024-01-02", "a")]),  # dup id
+                 _moment(momentId="m2", pictureURLs=[_pic("2024-01-01", "b")])],
+                has_more=False,
+            ),
         }
-        calls: list[int] = []
+        calls = []
 
         def post(child_id, counter):
             calls.append(counter)
             return pages[counter]
 
         with redirect_stdout(io.StringIO()):
-            urls = feed_api.collect_api_urls(post, "child", initial_counter=100)
-        self.assertEqual(calls, [100, 90, 80])
-        self.assertEqual(len(urls), 3)
-
-    def test_dedupes_across_pages(self):
-        u = _pic("2024-01-02", "a")
-        pages = {
-            100: _payload([{"pictureURLs": [u]}], has_more=True, counter=90),
-            90: _payload([{"pictureURLs": [u]}], has_more=False),
-        }
-        with redirect_stdout(io.StringIO()):
-            urls = feed_api.collect_api_urls(lambda c, n: pages[n], "child", initial_counter=100)
-        self.assertEqual(urls, [u])
+            records = feed_api.collect_moments(post, "child", initial_counter=100)
+        self.assertEqual(calls, [100, 90])
+        self.assertEqual([r.moment_id for r in records], ["m1", "m2"])
 
     def test_safety_break_when_cursor_stalls(self):
-        stuck = _payload([], has_more=True, counter=100)  # counter never moves off 100
-        calls: list[int] = []
+        stuck = _payload([], has_more=True, counter=100)
+        calls = []
 
         def post(cid, counter):
             calls.append(counter)
             return stuck
 
         with redirect_stdout(io.StringIO()):
-            feed_api.collect_api_urls(post, "child", initial_counter=100)
+            feed_api.collect_moments(post, "child", initial_counter=100)
         self.assertEqual(calls, [100])
-
-    def test_max_pages_cap(self):
-        def post(cid, counter):
-            return _payload([], has_more=True, counter=counter - 1)
-
-        calls: list[int] = []
-
-        def counting_post(cid, counter):
-            calls.append(counter)
-            return post(cid, counter)
-
-        with redirect_stdout(io.StringIO()):
-            feed_api.collect_api_urls(counting_post, "child", initial_counter=1000, max_pages=3)
-        self.assertEqual(len(calls), 3)
 
     def test_keyboard_interrupt_returns_partial(self):
         def post(cid, counter):
             if counter == 100:
-                return _payload([{"pictureURLs": [_pic("2024-01-02", "a")]}], has_more=True, counter=90)
+                return _payload(
+                    [_moment(momentId="m1", pictureURLs=[_pic("2024-01-02", "a")])],
+                    has_more=True,
+                    counter=90,
+                )
             raise KeyboardInterrupt
 
         with redirect_stdout(io.StringIO()):
-            urls = feed_api.collect_api_urls(post, "child", initial_counter=100)
-        self.assertEqual(len(urls), 1)
+            records = feed_api.collect_moments(post, "child", initial_counter=100)
+        self.assertEqual(len(records), 1)
+
+
+class CollectApiUrlsTests(unittest.TestCase):
+    def test_returns_deduped_photo_urls(self):
+        u = _pic("2024-01-02", "a")
+        pages = {
+            100: _payload([_moment(momentId="m1", pictureURLs=[u])], has_more=True, counter=90),
+            90: _payload([_moment(momentId="m2", pictureURLs=[u])], has_more=False),
+        }
+        with redirect_stdout(io.StringIO()):
+            urls = feed_api.collect_api_urls(lambda c, n: pages[n], "child", initial_counter=100)
+        self.assertEqual(urls, [u])
 
 
 class ReadCredentialsTests(unittest.TestCase):
@@ -170,21 +212,24 @@ class ReadCredentialsTests(unittest.TestCase):
             )
 
 
+class _Resp:
+    def __init__(self, status, body=b"{}", content_type="application/json"):
+        self.status = status
+        self._body = body
+        self.headers = {"Content-Type": content_type}
+
+    def read(self, *args):
+        body, self._body = self._body, b""
+        return body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class FetchMomentPageTests(unittest.TestCase):
-    class _Resp:
-        def __init__(self, status, body=b"{}"):
-            self.status = status
-            self._body = body
-
-        def read(self):
-            return self._body
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
     def test_posts_json_body_and_parses(self):
         captured = {}
 
@@ -193,7 +238,7 @@ class FetchMomentPageTests(unittest.TestCase):
                 captured["url"] = request.full_url
                 captured["data"] = request.data
                 captured["headers"] = dict(request.headers)
-                return FetchMomentPageTests._Resp(200, json.dumps({"data": {"hasMore": False}}).encode())
+                return _Resp(200, json.dumps({"data": {"hasMore": False}}).encode())
 
         payload = feed_api.fetch_moment_page(Opener(), "tok", "cid", 42)
         self.assertEqual(payload, {"data": {"hasMore": False}})
@@ -202,17 +247,131 @@ class FetchMomentPageTests(unittest.TestCase):
             json.loads(captured["data"]),
             {"childIds": ["cid"], "counter": 42, "paChildIds": ["cid"]},
         )
-        # urllib title-cases header names.
         self.assertEqual(captured["headers"].get("Client"), "fa_app")
         self.assertEqual(captured["headers"].get("Authorization"), "Bearer tok")
 
     def test_non_200_raises(self):
         class Opener:
             def open(self, request, timeout=0):
-                return FetchMomentPageTests._Resp(500)
+                return _Resp(500)
 
         with self.assertRaises(eo.SmokeError):
             feed_api.fetch_moment_page(Opener(), "t", "c", 1)
+
+
+class VideoDestinationTests(unittest.TestCase):
+    def test_dated_filename(self):
+        dest = feed_api.video_destination(_vid("2024-01-02", "v"), Path("/out"))
+        self.assertTrue(dest.name.startswith("2024-01-02_"))
+        self.assertTrue(dest.name.endswith(".mp4"))
+
+    def test_unknown_date_prefix(self):
+        dest = feed_api.video_destination(f"{CDN}/x/y.mp4", Path("/out"))
+        self.assertTrue(dest.name.startswith("unknown-date_"))
+
+
+class DownloadVideoTests(unittest.TestCase):
+    def _opener(self, resp):
+        class Opener:
+            def open(self, request, timeout=0):
+                return resp
+
+        return Opener()
+
+    def test_accepts_video_content_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "v.mp4"
+            opener = self._opener(_Resp(200, b"x" * 4096, content_type="video/mp4"))
+            size = feed_api.download_video(opener, _vid("2024-01-02", "v"), dest)
+            self.assertEqual(size, 4096)
+            self.assertTrue(dest.exists())
+
+    def test_rejects_wrong_content_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "v.mp4"
+            opener = self._opener(_Resp(200, b"<html>", content_type="text/html"))
+            with self.assertRaises(eo.SmokeError):
+                feed_api.download_video(opener, _vid("2024-01-02", "v"), dest)
+            self.assertFalse(dest.exists())
+
+    def test_non_200_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(eo.SmokeError):
+                feed_api.download_video(
+                    self._opener(_Resp(404, content_type="video/mp4")),
+                    _vid("2024-01-02", "v"),
+                    Path(tmp) / "v.mp4",
+                )
+
+
+class DownloadVideosTests(unittest.TestCase):
+    def _records(self, *videos):
+        return [feed_api.MomentRecord(f"m{i}", "", "", (), v) for i, v in enumerate(videos)]
+
+    def test_downloads_unique_and_skips_existing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            v1, v2 = _vid("2024-01-02", "a"), _vid("2024-01-03", "b")
+            # Pre-create v1 so it is skipped as existing.
+            existing = feed_api.video_destination(v1, out)
+            existing.write_bytes(b"x" * 4096)
+            calls = []
+
+            def fake_downloader(opener, url, dest):
+                calls.append(url)
+                dest.write_bytes(b"y" * 4096)
+
+            with redirect_stdout(io.StringIO()):
+                summary = feed_api.download_videos(
+                    self._records(v1, v2, v2),  # v2 duplicated
+                    out,
+                    opener=object(),
+                    video_downloader=fake_downloader,
+                )
+            self.assertEqual(summary.total, 2)  # v1, v2 (deduped)
+            self.assertEqual(summary.existing, 1)
+            self.assertEqual(summary.downloaded, 1)
+            self.assertEqual(calls, [v2])
+
+    def test_no_videos_returns_empty(self):
+        summary = feed_api.download_videos(self._records(None, None), Path("/x"))
+        self.assertEqual(summary, feed_api.VideoSummary(0, 0, 0, 0))
+
+
+class WriteManifestTests(unittest.TestCase):
+    def test_manifest_uses_filenames_not_urls(self):
+        records = [
+            feed_api.MomentRecord(
+                "m1", "2024-01-02 10:00", "去公园", (_pic("2024-01-02", "a"),), _vid("2024-01-02", "v")
+            ),
+            feed_api.MomentRecord("m2", "2024-01-03", "", (), None),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "moments.jsonl"
+            n = feed_api.write_manifest(records, path)
+            self.assertEqual(n, 2)
+            lines = path.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("http", "\n".join(lines))  # no URLs leaked
+        first = json.loads(lines[0])
+        self.assertEqual(first["caption"], "去公园")
+        self.assertTrue(first["photos"][0].startswith("originals/2024-01-02_"))
+        self.assertTrue(first["video"].startswith("videos/2024-01-02_"))
+        self.assertIsNone(json.loads(lines[1])["video"])
+
+
+class WriteCaptionsTests(unittest.TestCase):
+    def test_writes_only_non_empty_with_time(self):
+        records = [
+            feed_api.MomentRecord("m1", "2024-01-02", "开心的一天", (), None),
+            feed_api.MomentRecord("m2", "2024-01-03", "   ", (), None),  # blank
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "captions.txt"
+            n = feed_api.write_captions(records, path)
+            text = path.read_text(encoding="utf-8")
+        self.assertEqual(n, 1)
+        self.assertIn("[2024-01-02] 开心的一天", text)
+        self.assertNotIn("m2", text)
 
 
 class RunApiTests(unittest.TestCase):
@@ -222,59 +381,73 @@ class RunApiTests(unittest.TestCase):
             '<string name="album_child_id">cid</string>'
         )
 
-    def test_happy_path_collects_and_downloads(self):
-        url = _pic("2024-01-02", "a")
-        page = _payload([{"pictureURLs": [url]}], has_more=False)
+    def _run(self, page, *, input_answer="DOWNLOAD", include_videos=True, downloader=None, video_patch=None):
+        downloader = downloader or (lambda urls, out: eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0))
+        with mock.patch.object(eo, "discover_running_device", return_value=eo.Device("s")), \
+                mock.patch.object(feed_api, "fetch_moment_page", return_value=page), \
+                mock.patch.object(eo, "ensure_build_is_ignored"), \
+                mock.patch.object(feed_api, "write_manifest", return_value=1) as wm, \
+                mock.patch.object(feed_api, "write_captions", return_value=1) as wc, \
+                mock.patch.object(feed_api, "download_videos", side_effect=video_patch or (lambda *a, **k: feed_api.VideoSummary(0, 0, 0, 0))) as dv:
+            with redirect_stdout(io.StringIO()):
+                rc = feed_api.run_api(
+                    run_command=lambda argv: self._creds(),
+                    opener=object(),
+                    input_fn=lambda prompt: input_answer,
+                    downloader=downloader,
+                    include_videos=include_videos,
+                )
+        return rc, wm, wc, dv
+
+    def test_happy_path_saves_text_and_downloads_photos(self):
+        page = _payload([_moment(momentId="m1", momentCaption="hi", pictureURLs=[_pic("2024-01-02", "a")])])
         got = {}
 
-        def fake_downloader(urls, output_dir):
+        def downloader(urls, out):
             got["urls"] = urls
             return eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0)
 
-        with mock.patch.object(eo, "discover_running_device", return_value=eo.Device("s")), \
-                mock.patch.object(feed_api, "fetch_moment_page", return_value=page):
-            with redirect_stdout(io.StringIO()):
-                rc = feed_api.run_api(
-                    run_command=lambda argv: self._creds(),
-                    opener=object(),
-                    input_fn=lambda prompt: "DOWNLOAD",
-                    downloader=fake_downloader,
-                )
+        rc, wm, wc, dv = self._run(page, downloader=downloader)
         self.assertEqual(rc, 0)
-        self.assertEqual(got["urls"], [url])
+        self.assertEqual(got["urls"], [_pic("2024-01-02", "a")])
+        wm.assert_called_once()
+        wc.assert_called_once()
+        dv.assert_not_called()  # no videos in page
 
-    def test_cancel_skips_download(self):
-        page = _payload([{"pictureURLs": [_pic("2024-01-02", "a")]}], has_more=False)
+    def test_downloads_videos_when_present(self):
+        page = _payload(
+            [_moment(momentId="m1", pictureURLs=[_pic("2024-01-02", "a")], videoUrl=_vid("2024-01-02", "v"))]
+        )
+        rc, wm, wc, dv = self._run(page, video_patch=lambda *a, **k: feed_api.VideoSummary(1, 1, 0, 0))
+        self.assertEqual(rc, 0)
+        dv.assert_called_once()
+
+    def test_no_videos_flag_skips_video_download(self):
+        page = _payload(
+            [_moment(momentId="m1", pictureURLs=[_pic("2024-01-02", "a")], videoUrl=_vid("2024-01-02", "v"))]
+        )
+        rc, wm, wc, dv = self._run(page, include_videos=False)
+        self.assertEqual(rc, 0)
+        dv.assert_not_called()
+
+    def test_cancel_saves_text_but_skips_download(self):
+        page = _payload([_moment(momentId="m1", momentCaption="hi", pictureURLs=[_pic("2024-01-02", "a")])])
         called = {"n": 0}
 
-        def fake_downloader(urls, output_dir):
+        def downloader(urls, out):
             called["n"] += 1
             return eo.BatchSummary(0, 0, 0, 0, 0, 0)
 
-        with mock.patch.object(eo, "discover_running_device", return_value=eo.Device("s")), \
-                mock.patch.object(feed_api, "fetch_moment_page", return_value=page):
-            with redirect_stdout(io.StringIO()):
-                rc = feed_api.run_api(
-                    run_command=lambda argv: self._creds(),
-                    opener=object(),
-                    input_fn=lambda prompt: "",  # not DOWNLOAD
-                    downloader=fake_downloader,
-                )
+        rc, wm, wc, dv = self._run(page, input_answer="", downloader=downloader)
         self.assertEqual(rc, 0)
         self.assertEqual(called["n"], 0)
+        wm.assert_called_once()  # text still saved
+        wc.assert_called_once()
 
-    def test_no_candidates_returns_zero(self):
-        empty = _payload([], has_more=False)
-        with mock.patch.object(eo, "discover_running_device", return_value=eo.Device("s")), \
-                mock.patch.object(feed_api, "fetch_moment_page", return_value=empty):
-            with redirect_stdout(io.StringIO()):
-                rc = feed_api.run_api(
-                    run_command=lambda argv: self._creds(),
-                    opener=object(),
-                    input_fn=lambda prompt: "DOWNLOAD",
-                    downloader=lambda urls, out: eo.BatchSummary(0, 0, 0, 0, 0, 0),
-                )
+    def test_no_records_returns_zero(self):
+        rc, wm, wc, dv = self._run(_payload([]))
         self.assertEqual(rc, 0)
+        wm.assert_not_called()
 
     def test_credentials_failure_returns_one(self):
         with mock.patch.object(eo, "discover_running_device", return_value=eo.Device("s")):
@@ -287,16 +460,18 @@ class RunApiTests(unittest.TestCase):
 
 
 class CliDispatchTests(unittest.TestCase):
-    def test_api_command_dispatches_with_counter(self):
+    def test_api_dispatches_with_counter_and_videos(self):
         with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
             rc = eo.main(["api", "--counter", "12345"])
         self.assertEqual(rc, 0)
-        run_api.assert_called_once_with(initial_counter=12345)
+        run_api.assert_called_once_with(initial_counter=12345, include_videos=True)
 
-    def test_api_command_defaults_counter(self):
+    def test_api_no_videos_flag(self):
         with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
-            eo.main(["api"])
-        run_api.assert_called_once_with(initial_counter=feed_api.DEFAULT_INITIAL_COUNTER)
+            eo.main(["api", "--no-videos"])
+        run_api.assert_called_once_with(
+            initial_counter=feed_api.DEFAULT_INITIAL_COUNTER, include_videos=False
+        )
 
 
 if __name__ == "__main__":
