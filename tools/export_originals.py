@@ -128,7 +128,7 @@ def validate_original_url(raw: str) -> str | None:
         return None
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         return None
-    if not parsed.path.endswith(".jpeg"):
+    if not parsed.path.endswith((".jpeg", ".jpg")):
         return None
     return raw
 
