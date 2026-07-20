@@ -42,7 +42,8 @@
 - `swipe_scroll(device, width, height)`：`adb shell input swipe cx y_start cx y_end duration`。`cx=width//2`，`y_start=0.75H`，`y_end=0.30H`（每次约 45% 屏幕位移，屏幕间保持 >50% 重叠，尽量不跳过整行导致漏图）；非零返回码 → `SmokeError("swipe-failed")`。
 - `dump_logcat_urls(device)`：`adb logcat -d -v brief`（**不绑定 pid**，与既有流式采集一致，以兼容重启/全量），返回 `extract_urls` 结果；非零返回码 → `SmokeError("logcat-failed")`。
 - `capture_screen_signature(device)`：`adb exec-out screencap -p`（二进制），返回截图字节的 sha256 摘要；失败或空 → `None`。字节只在内存里算哈希即弃。
-- `collect_with_auto_scroll(device, ..., max_stable_screens=2, max_swipes=2000, settle_seconds=2.0)`：先 dump 一次抓取启动缓冲并截一次基线图；随后循环「滑动 → sleep(settle) → dump 合并 → 截图算哈希」；画面与上次相同则累加稳定计数，否则清零；连续 `max_stable_screens` 次画面不变即判定到底停止；`max_swipes` 为安全上限。全程可 Ctrl-C 提前结束并返回已采集部分。返回**有序去重**列表。
+- `collect_with_auto_scroll(device, ..., max_stable_screens=6, max_swipes=2000, settle_seconds=2.5)`：先 dump 一次抓取启动缓冲并截一次基线图；随后循环「滑动 → sleep(settle) → dump 合并 → 截图算哈希」；画面与上次相同则累加稳定计数，否则清零；连续 `max_stable_screens` 次画面不变才判定到底停止；`max_swipes` 为安全上限。全程可 Ctrl-C 提前结束并返回已采集部分。返回**有序去重**列表。
+  - **阈值取值（真机调优）**：初版 `max_stable_screens=2` 太松——列表中途一次偶发「滑动没动/加载中静止帧」就凑成 2 帧相同、误判到底（真机上分别停在 534、664，均非真底）。提高到 6（配合 2.5s settle）后，只有画面持续约十几秒不变才停，滤掉中途偶发相同。
 
 ## 4. CLI 集成
 
@@ -53,6 +54,29 @@
 ## 5. 隐私
 
 - 所有新命令行参数只含坐标/尺寸/常量，**不含 URL**；进度只打印计数；dump 结果只在内存中 `extract_urls` 后即抛弃原文。测试对每条 argv 断言无 `https://`。
+
+## 5.1 真机重大发现（2026-07-19，大相册）
+
+手动 + 自动滚动一个跨 2023–2024+ 的大相册时观察到：
+
+1. **越滑越卡、加载越来越慢，最后 App 崩溃（OOM）**——手动滚同样崩，说明是 **App/模拟器侧内存上限**，非自动滚动之过。
+2. **滚动位置回弹 bug**：加载完新一页后视图跳回更靠前的位置（如 2024-01 加载后跳回 2024-04），需再滑回触发点才会加载下一页，加载后又跳回。URL 由 logcat 采集、与画面位置无关，故回弹不致命；**致命的是崩溃**。
+
+**结论**：对大相册，任何「滚到底」策略（截屏哈希 / 结尾标记）都无效——**App 在到底前就崩**，最旧的照片藏在崩溃墙后，UI 滚动可能根本够不到。瓶颈是 App 内存，不是停止判据。
+
+**候选缓解方向**（待与用户确认）：加大 MuMu 分配内存（用户侧设置，可能把崩溃点往后推甚至到底）；接受「能采多少采多少」的分块现实；或研究非 UI 的 API 分页路径（大改，另议）。自动滚动对**中小相册**仍有效（真机曾采到 664+）。
+
+## 5.2 非-UI API 路径调研（2026-07-20，为绕开崩溃墙）
+
+结论供后续「全库导出」参考：
+
+- 照片 feed 是 App **原生页面**（APK 无 RN/Flutter bundle），数据来自 App 调 `api-gateway.childfolio.net`；`web.childfolio.net` 是**老师版 + 共享聊天 SPA**，家长照片**无网页版可绕**。
+- API **鉴权为 Bearer token**（`Authorization: Bearer <accessToken>`），**无逐请求签名**——直连可行且轻量。`accessToken`、`album_child_id` 存于 App `shared_prefs`。
+- 已跑通**照片冲印**接口：`GET /frame/phone/getlistterm?childId=<uuid>` 返回学期列表（字段 id/name/startDate/endDate/url），但这是冲印功能、**非成长 feed**（本账号基本为空）。
+- **成长 feed 的确切接口未定位**：`family/*`、`getpagelistalbum`、album 域名等前缀均 404；App 不把 API 调用打进 logcat。可靠定位需 **MITM 抓一次真实请求**。
+- **边界**：本环境安全层拦截「启动拦截代理 / 读 token / MITM 分析」，故 MITM **须由用户在本机自行完成**；拿到接口规格（endpoint+参数+头）后再据此写直连导出器（纯编码、不涉及拦截）。
+
+**结论**：auto-scroll（UI）作为中小相册的 v1；**全库导出留作独立后续**，依赖用户侧 MITM 得到 feed 接口规格。
 
 ## 6. 已知限制（第一版有意取舍）
 
