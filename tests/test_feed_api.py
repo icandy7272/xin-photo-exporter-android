@@ -381,7 +381,7 @@ class RunApiTests(unittest.TestCase):
             '<string name="album_child_id">cid</string>'
         )
 
-    def _run(self, page, *, input_answer="DOWNLOAD", include_videos=True, downloader=None, video_patch=None):
+    def _run(self, page, *, input_answer="DOWNLOAD", include_videos=True, assume_yes=False, downloader=None, video_patch=None):
         downloader = downloader or (lambda urls, out: eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0))
         with mock.patch.object(eo, "discover_running_device", return_value=eo.Device("s")), \
                 mock.patch.object(feed_api, "fetch_moment_page", return_value=page), \
@@ -396,6 +396,7 @@ class RunApiTests(unittest.TestCase):
                     input_fn=lambda prompt: input_answer,
                     downloader=downloader,
                     include_videos=include_videos,
+                    assume_yes=assume_yes,
                 )
         return rc, wm, wc, dv
 
@@ -444,6 +445,19 @@ class RunApiTests(unittest.TestCase):
         wm.assert_called_once()  # text still saved
         wc.assert_called_once()
 
+    def test_yes_flag_downloads_without_confirmation(self):
+        page = _payload([_moment(momentId="m1", pictureURLs=[_pic("2024-01-02", "a")])])
+        called = {"n": 0}
+
+        def downloader(urls, out):
+            called["n"] += 1
+            return eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0)
+
+        # input_answer would cancel, but --yes skips the prompt entirely.
+        rc, wm, wc, dv = self._run(page, input_answer="", assume_yes=True, downloader=downloader)
+        self.assertEqual(rc, 0)
+        self.assertEqual(called["n"], 1)
+
     def test_no_records_returns_zero(self):
         rc, wm, wc, dv = self._run(_payload([]))
         self.assertEqual(rc, 0)
@@ -464,13 +478,26 @@ class CliDispatchTests(unittest.TestCase):
         with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
             rc = eo.main(["api", "--counter", "12345"])
         self.assertEqual(rc, 0)
-        run_api.assert_called_once_with(initial_counter=12345, include_videos=True)
+        run_api.assert_called_once_with(
+            initial_counter=12345, include_videos=True, assume_yes=False
+        )
 
     def test_api_no_videos_flag(self):
         with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
             eo.main(["api", "--no-videos"])
         run_api.assert_called_once_with(
-            initial_counter=feed_api.DEFAULT_INITIAL_COUNTER, include_videos=False
+            initial_counter=feed_api.DEFAULT_INITIAL_COUNTER,
+            include_videos=False,
+            assume_yes=False,
+        )
+
+    def test_api_yes_flag(self):
+        with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
+            eo.main(["api", "--yes"])
+        run_api.assert_called_once_with(
+            initial_counter=feed_api.DEFAULT_INITIAL_COUNTER,
+            include_videos=True,
+            assume_yes=True,
         )
 
 

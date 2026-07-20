@@ -455,6 +455,7 @@ def run_api(
     output_dir: Path = PHOTO_OUTPUT,
     video_output_dir: Path = VIDEO_OUTPUT,
     include_videos: bool = True,
+    assume_yes: bool = False,
     initial_counter: int = DEFAULT_INITIAL_COUNTER,
 ) -> int:
     """Collect the whole feed, save post text, then confirm and download."""
@@ -484,7 +485,9 @@ def run_api(
         if not photo_urls and video_total == 0:
             print("没有可下载的媒体（正文已保存）。")
             return 0
-        if not eo.confirm_download(len(photo_urls), input_fn):
+        if assume_yes:
+            print(f"已确认下载（--yes）：{len(photo_urls)} 原图，{video_total} 视频")
+        elif not eo.confirm_download(len(photo_urls), input_fn):
             print("已取消媒体下载；正文已保存。")
             return 0
         photo_result = (downloader or eo.download_batch)(photo_urls, output_dir)

@@ -796,10 +796,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="只下照片，不下载视频（正文仍会保存）",
     )
+    api_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="跳过 DOWNLOAD 交互确认，直接下载（用于非交互/自动化）",
+    )
     return parser
 
 
-def _run_api(counter: int | None, include_videos: bool) -> int:
+def _run_api(counter: int | None, include_videos: bool, assume_yes: bool) -> int:
     try:
         from tools.feed_api import DEFAULT_INITIAL_COUNTER, run_api
     except ImportError:
@@ -807,6 +812,7 @@ def _run_api(counter: int | None, include_videos: bool) -> int:
     return run_api(
         initial_counter=counter or DEFAULT_INITIAL_COUNTER,
         include_videos=include_videos,
+        assume_yes=assume_yes,
     )
 
 
@@ -815,7 +821,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "batch":
         return run_batch(auto_scroll=args.auto_scroll)
     if args.command == "api":
-        return _run_api(args.counter, include_videos=not args.no_videos)
+        return _run_api(
+            args.counter, include_videos=not args.no_videos, assume_yes=args.yes
+        )
     return run_smoke(execute=args.execute)
 
 
