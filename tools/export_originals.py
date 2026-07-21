@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Minimal, privacy-conscious original-photo smoke exporter."""
+"""鑫时光集内容导出器：设备发现、URL 校验、媒体下载核心 + `api` CLI。
+
+直连后端 feed 接口的分页/正文/视频逻辑在 ``feed_api`` 中；本模块提供它
+复用的下载与校验基础，以及命令行入口。仅处理用户本人账号内容，所有
+数据只在本机处理。
+"""
 
 from __future__ import annotations
 
@@ -7,10 +12,10 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import ssl
 import subprocess
 import time
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -20,7 +25,6 @@ import urllib.request
 
 
 CDN_HOST = "cdn-mctchildfoliocn.childfolio.net"
-ORIGINAL_URL_RE = re.compile(r"原图地址::(\S+)")
 MUMUTOOL = Path("/Applications/MuMuPlayer.app/Contents/MacOS/mumutool")
 ADB = Path(
     "/Applications/MuMuPlayer.app/Contents/MacOS/"
@@ -31,27 +35,18 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MIN_BYTES = 1024
 MAX_BYTES = 50 * 1024 * 1024
 CHUNK_BYTES = 64 * 1024
-# Content photos are jpeg/jpg or png (both seen on the CDN, no query).
+# Content photos are jpeg/jpg or png (all seen on the CDN, no query).
 IMAGE_EXTS = (".jpeg", ".jpg", ".png")
 ALLOWED_IMAGE_TYPES = ("image/jpeg", "image/png")
 IMAGE_MAGIC = (b"\xff\xd8", b"\x89P")  # JPEG, PNG
 SYSTEM_CA_FILE = Path("/etc/ssl/cert.pem")
 SETFILE = Path("/usr/bin/SetFile")
-RECORD_DATE_RE = re.compile(
-    r"(?:^|/)moments/images/(\d{4}-\d{2}-\d{2})(?:/|$)"
-)
+RECORD_DATE_RE = re.compile(r"(?:^|/)moments/images/(\d{4}-\d{2}-\d{2})(?:/|$)")
 BATCH_OUTPUT = REPOSITORY_ROOT / "build" / "originals"
-WM_SIZE_RE = re.compile(r"(\d+)x(\d+)")
-SWIPE_DURATION_MS = 300
-SWIPE_START_FRACTION = 0.75
-SWIPE_END_FRACTION = 0.30
-DEFAULT_MAX_STABLE_SCREENS = 6
-DEFAULT_MAX_SWIPES = 2000
-DEFAULT_SETTLE_SECONDS = 2.5
 
 
 class SmokeError(RuntimeError):
-    """Expected smoke-check failure whose message contains no sensitive URL."""
+    """Expected failure whose message contains no sensitive URL."""
 
 
 @dataclass(frozen=True)
@@ -112,14 +107,6 @@ def run_command(argv: list[str | Path]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def run_binary_command(argv: list[str | Path]) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
-        [str(value) for value in argv],
-        capture_output=True,
-        check=False,
-    )
-
-
 def validate_original_url(raw: str) -> str | None:
     try:
         parsed = urllib.parse.urlsplit(raw)
@@ -135,17 +122,6 @@ def validate_original_url(raw: str) -> str | None:
     if not parsed.path.endswith(IMAGE_EXTS):
         return None
     return raw
-
-
-def extract_urls(text: str) -> list[str]:
-    found: list[str] = []
-    seen: set[str] = set()
-    for match in ORIGINAL_URL_RE.finditer(text):
-        candidate = validate_original_url(match.group(1))
-        if candidate is not None and candidate not in seen:
-            found.append(candidate)
-            seen.add(candidate)
-    return found
 
 
 def extract_record_date(url: str) -> date | None:
@@ -170,13 +146,6 @@ def batch_destination(url: str, output_dir: Path) -> Path:
     return output_dir / f"{prefix}_{digest}{ext}"
 
 
-def select_samples(urls: list[str], count: int = 3) -> list[str]:
-    samples = list(dict.fromkeys(urls))[:count]
-    if len(samples) < count:
-        raise SmokeError("not-enough-candidates")
-    return samples
-
-
 def _info_rows(payload: object) -> list[dict]:
     if isinstance(payload, list):
         return [row for row in payload if isinstance(row, dict)]
@@ -188,9 +157,7 @@ def _info_rows(payload: object) -> list[dict]:
     return []
 
 
-def discover_running_device(
-    run_command: Callable = run_command,
-) -> Device:
+def discover_running_device(run_command: Callable = run_command) -> Device:
     result = run_command([MUMUTOOL, "info", "all"])
     if result.returncode != 0:
         raise SmokeError("mumu-not-running")
@@ -221,221 +188,6 @@ def discover_running_device(
     return Device(serial=serial)
 
 
-def discover_app_pid(device: Device, run_command: Callable = run_command) -> int:
-    result = run_command([ADB, "-s", device.serial, "shell", "pidof", PACKAGE])
-    values = result.stdout.split() if result.returncode == 0 else []
-    if len(values) != 1 or not values[0].isdigit():
-        raise SmokeError("app-not-running")
-    return int(values[0])
-
-
-def read_current_logcat(
-    device: Device, pid: int, run_command: Callable = run_command
-) -> str:
-    result = run_command(
-        [ADB, "-s", device.serial, "logcat", "-d", f"--pid={pid}", "-v", "brief"]
-    )
-    if result.returncode != 0:
-        raise SmokeError("logcat-failed")
-    return result.stdout
-
-
-def start_logcat_stream(
-    device: Device,
-    _pid: int,
-    popen: Callable = subprocess.Popen,
-):
-    try:
-        return popen(
-            [
-                str(ADB),
-                "-s",
-                device.serial,
-                "logcat",
-                "-v",
-                "brief",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            errors="replace",
-            bufsize=1,
-        )
-    except OSError:
-        raise SmokeError("logcat-stream-failed") from None
-
-
-def _stop_logcat_process(process) -> None:
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=2)
-
-
-def collect_streaming_urls(
-    device: Device,
-    pid: int,
-    *,
-    popen: Callable = subprocess.Popen,
-    progress: Callable[[str], None] = print,
-) -> list[str]:
-    process = start_logcat_stream(device, pid, popen)
-    if process.stdout is None:
-        _stop_logcat_process(process)
-        raise SmokeError("logcat-stream-failed")
-    ordered: list[str] = []
-    seen: set[str] = set()
-    user_stopped = False
-    try:
-        for line in process.stdout:
-            for url in extract_urls(line):
-                if url not in seen:
-                    seen.add(url)
-                    ordered.append(url)
-                    progress(f"已发现唯一原图：{len(ordered)}")
-    except KeyboardInterrupt:
-        user_stopped = True
-    except Exception:
-        raise SmokeError("logcat-stream-failed") from None
-    finally:
-        _stop_logcat_process(process)
-    if not user_stopped:
-        raise SmokeError("logcat-stream-failed")
-    return ordered
-
-
-def get_screen_size(
-    device: Device, run_command: Callable = run_command
-) -> tuple[int, int]:
-    result = run_command([ADB, "-s", device.serial, "shell", "wm", "size"])
-    if result.returncode != 0:
-        raise SmokeError("screen-size-failed")
-    override: tuple[int, int] | None = None
-    physical: tuple[int, int] | None = None
-    for line in result.stdout.splitlines():
-        match = WM_SIZE_RE.search(line)
-        if match is None:
-            continue
-        size = (int(match.group(1)), int(match.group(2)))
-        if "Override" in line:
-            override = size
-        elif "Physical" in line:
-            physical = size
-    chosen = override or physical
-    if chosen is None or chosen[0] <= 0 or chosen[1] <= 0:
-        raise SmokeError("screen-size-failed")
-    return chosen
-
-
-def swipe_scroll(
-    device: Device,
-    width: int,
-    height: int,
-    *,
-    run_command: Callable = run_command,
-    duration_ms: int = SWIPE_DURATION_MS,
-) -> None:
-    center_x = width // 2
-    y_start = int(height * SWIPE_START_FRACTION)
-    y_end = int(height * SWIPE_END_FRACTION)
-    result = run_command(
-        [
-            ADB,
-            "-s",
-            device.serial,
-            "shell",
-            "input",
-            "swipe",
-            str(center_x),
-            str(y_start),
-            str(center_x),
-            str(y_end),
-            str(duration_ms),
-        ]
-    )
-    if result.returncode != 0:
-        raise SmokeError("swipe-failed")
-
-
-def dump_logcat_urls(
-    device: Device, run_binary: Callable = run_binary_command
-) -> list[str]:
-    result = run_binary(
-        [ADB, "-s", device.serial, "logcat", "-d", "-v", "brief"]
-    )
-    if result.returncode != 0:
-        raise SmokeError("logcat-failed")
-    stdout = result.stdout
-    text = (
-        stdout.decode("utf-8", "replace") if isinstance(stdout, bytes) else stdout
-    )
-    return extract_urls(text)
-
-
-def capture_screen_signature(
-    device: Device, run_binary: Callable = run_binary_command
-) -> bytes | None:
-    """Return a hash of the current screen, or None if capture failed.
-
-    The screenshot bytes only exist in memory long enough to hash; they are
-    never written to disk, printed, or transmitted. Only the opaque digest is
-    kept, purely to decide whether the list is still scrolling.
-    """
-    result = run_binary(
-        [ADB, "-s", device.serial, "exec-out", "screencap", "-p"]
-    )
-    if result.returncode != 0 or not result.stdout:
-        return None
-    return hashlib.sha256(result.stdout).digest()
-
-
-def collect_with_auto_scroll(
-    device: Device,
-    *,
-    run_command: Callable = run_command,
-    run_binary: Callable = run_binary_command,
-    sleep_fn: Callable = time.sleep,
-    progress: Callable[[str], None] = print,
-    max_stable_screens: int = DEFAULT_MAX_STABLE_SCREENS,
-    max_swipes: int = DEFAULT_MAX_SWIPES,
-    settle_seconds: float = DEFAULT_SETTLE_SECONDS,
-) -> list[str]:
-    width, height = get_screen_size(device, run_command=run_command)
-    ordered: list[str] = []
-    seen: set[str] = set()
-
-    def merge() -> None:
-        for url in dump_logcat_urls(device, run_binary=run_binary):
-            if url not in seen:
-                seen.add(url)
-                ordered.append(url)
-
-    try:
-        merge()
-        progress(f"已发现唯一原图：{len(ordered)}")
-        last_signature = capture_screen_signature(device, run_binary=run_binary)
-        stable = 0
-        swipes = 0
-        while stable < max_stable_screens and swipes < max_swipes:
-            swipe_scroll(device, width, height, run_command=run_command)
-            sleep_fn(settle_seconds)
-            merge()
-            signature = capture_screen_signature(device, run_binary=run_binary)
-            if signature is not None and signature == last_signature:
-                stable += 1
-            else:
-                stable = 0
-            last_signature = signature
-            swipes += 1
-            progress(f"已发现唯一原图：{len(ordered)}")
-    except KeyboardInterrupt:
-        pass
-    return ordered
-
-
 def apply_record_date(
     destination: Path,
     record_date: date | None,
@@ -444,20 +196,13 @@ def apply_record_date(
     if record_date is None:
         return True
     local_noon = datetime(
-        record_date.year,
-        record_date.month,
-        record_date.day,
-        12,
-        0,
-        0,
+        record_date.year, record_date.month, record_date.day, 12, 0, 0
     ).astimezone()
     timestamp = local_noon.timestamp()
     formatted = record_date.strftime("%m/%d/%Y 12:00:00")
     try:
         os.utime(destination, (timestamp, timestamp))
-        result = run_command(
-            [SETFILE, "-d", formatted, "-m", formatted, destination]
-        )
+        result = run_command([SETFILE, "-d", formatted, "-m", formatted, destination])
     except OSError:
         return False
     return result.returncode == 0
@@ -481,12 +226,14 @@ def download_sample(
     digest = hashlib.sha256()
     byte_count = 0
     first_bytes = b""
-    request = urllib.request.Request(url, headers={"User-Agent": "xin-photo-smoke/1"})
+    request = urllib.request.Request(url, headers={"User-Agent": "xin-photo-export/1"})
     try:
         with opener.open(request, timeout=timeout) as response:
             if response.status != 200:
                 raise SmokeError("http-not-200")
-            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            content_type = (
+                response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            )
             if content_type not in ALLOWED_IMAGE_TYPES:
                 raise SmokeError("wrong-content-type")
             with part.open("xb") as output:
@@ -632,20 +379,6 @@ def _print_batch_summary(summary: BatchSummary, output_dir: Path) -> None:
     print(f"输出目录：{output_dir}")
 
 
-def create_run_directory(parent: Path, timestamp: str | None = None) -> Path:
-    parent.mkdir(parents=True, exist_ok=True)
-    base = timestamp or datetime.now().strftime("%Y%m%d-%H%M%S")
-    suffix = 0
-    while True:
-        name = base if suffix == 0 else f"{base}-{suffix}"
-        candidate = parent / name
-        try:
-            candidate.mkdir(exist_ok=False)
-            return candidate
-        except FileExistsError:
-            suffix += 1
-
-
 def ensure_build_is_ignored(repository_root: Path = REPOSITORY_ROOT) -> None:
     ignore_file = repository_root / ".gitignore"
     try:
@@ -660,71 +393,6 @@ def ensure_build_is_ignored(repository_root: Path = REPOSITORY_ROOT) -> None:
         raise SmokeError("build-not-ignored")
 
 
-def execute_samples(
-    samples: list[str],
-    output_parent: Path,
-    *,
-    opener=None,
-    timestamp: str | None = None,
-    require_ignore: bool = True,
-) -> int:
-    if len(samples) != 3:
-        raise SmokeError("sample-count-not-three")
-    if require_ignore:
-        ensure_build_is_ignored()
-    previous_umask = os.umask(0o077)
-    try:
-        run_directory = create_run_directory(output_parent, timestamp)
-        opener = opener or build_opener()
-        successes = 0
-        failures = 0
-        seen_hashes: set[str] = set()
-        print("提示：仅处理本人账号；样本像素与 EXIF 可能包含敏感信息。")
-        for ordinal, url in enumerate(samples, start=1):
-            destination = run_directory / f"sample-{ordinal:02d}.jpeg"
-            try:
-                result = download_sample(opener, url, destination)
-                duplicate = result.sha256 in seen_hashes
-                seen_hashes.add(result.sha256)
-                successes += 1
-                label = "（内容重复）" if duplicate else ""
-                print(
-                    f"样本 {ordinal}：成功，{result.byte_count} 字节，"
-                    f"SHA-256 {result.sha256}{label}"
-                )
-            except SmokeError as exc:
-                failures += 1
-                print(f"样本 {ordinal}：失败（{exc}）")
-        print(f"完成：成功 {successes}，失败 {failures}")
-        print(f"样本目录：{run_directory}")
-        return 0 if failures == 0 else 1
-    finally:
-        os.umask(previous_umask)
-
-
-def run_smoke(
-    execute: bool = False,
-    *,
-    run_command: Callable = run_command,
-    downloader: Callable | None = None,
-    output_parent: Path | None = None,
-) -> int:
-    device = discover_running_device(run_command)
-    pid = discover_app_pid(device, run_command)
-    urls = extract_urls(read_current_logcat(device, pid, run_command))
-    samples = select_samples(urls)
-    destination = output_parent or REPOSITORY_ROOT / "build" / "direct-original-smoke"
-    print("MuMu 设备：已连接")
-    print("目标 App：已运行")
-    print(f"候选原图：{len(urls)}")
-    print(f"计划样本：{len(samples)}")
-    print(f"输出父目录：{destination}")
-    if not execute:
-        return 0
-    downloader = downloader or execute_samples
-    return downloader(samples, destination)
-
-
 def confirm_download(candidate_count: int, input_fn: Callable = input) -> bool:
     try:
         answer = input_fn(
@@ -735,60 +403,13 @@ def confirm_download(candidate_count: int, input_fn: Callable = input) -> bool:
     return answer == "DOWNLOAD"
 
 
-def run_batch(
-    *,
-    run_command: Callable = run_command,
-    popen: Callable = subprocess.Popen,
-    input_fn: Callable = input,
-    downloader: Callable | None = None,
-    output_dir: Path = BATCH_OUTPUT,
-    auto_scroll: bool = False,
-) -> int:
-    device = discover_running_device(run_command)
-    pid = discover_app_pid(device, run_command)
-    if auto_scroll:
-        print(
-            "批量采集已启动（自动滚动）；连续无新候选会自动停止，"
-            "可随时按 Ctrl-C 提前结束。"
-        )
-        candidates = collect_with_auto_scroll(device, run_command=run_command)
-    else:
-        print("批量采集已启动；请在 MuMu 中手动滚动，完成后按 Ctrl-C。")
-        candidates = collect_streaming_urls(device, pid, popen=popen)
-    print(f"采集结束：{len(candidates)} 个唯一原图候选。")
-    if not candidates:
-        print("没有候选，不创建输出目录。")
-        return 0
-    if not confirm_download(len(candidates), input_fn):
-        print("已取消；没有下载照片。")
-        return 0
-    downloader = downloader or download_batch
-    result = downloader(candidates, output_dir)
-    if isinstance(result, int):
-        return result
-    if result.failed == 0 and result.unprocessed == 0:
-        print("本轮候选下载完成。")
-        return 0
-    print("本轮候选尚未全部完成。")
-    return 1
-
-
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="鑫时光集 Android 原图 Smoke 验证")
-    parser.add_argument(
-        "--execute",
-        action="store_true",
-        help="明确下载且只下载三个原图样本",
+    parser = argparse.ArgumentParser(
+        description="鑫时光集内容导出器（直连 API：照片 / 视频 / 帖子正文）"
     )
     subparsers = parser.add_subparsers(dest="command")
-    batch_parser = subparsers.add_parser("batch", help="手动滚动并流式采集批量原图")
-    batch_parser.add_argument(
-        "--auto-scroll",
-        action="store_true",
-        help="自动滚动相册并在连续无新候选时停止",
-    )
     api_parser = subparsers.add_parser(
-        "api", help="直连后端 API 分页导出全部原图/视频/正文"
+        "api", help="直连后端 API 分页导出全部原图 / 视频 / 正文"
     )
     api_parser.add_argument(
         "--counter",
@@ -804,7 +425,7 @@ def build_parser() -> argparse.ArgumentParser:
     api_parser.add_argument(
         "--yes",
         action="store_true",
-        help="跳过 DOWNLOAD 交互确认，直接下载（用于非交互/自动化）",
+        help="跳过 DOWNLOAD 交互确认，直接下载（用于非交互 / 自动化）",
     )
     return parser
 
@@ -822,14 +443,14 @@ def _run_api(counter: int | None, include_videos: bool, assume_yes: bool) -> int
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    if args.command == "batch":
-        return run_batch(auto_scroll=args.auto_scroll)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.command == "api":
         return _run_api(
             args.counter, include_videos=not args.no_videos, assume_yes=args.yes
         )
-    return run_smoke(execute=args.execute)
+    parser.print_help()
+    return 1
 
 
 if __name__ == "__main__":
