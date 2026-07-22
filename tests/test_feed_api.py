@@ -63,7 +63,7 @@ class ValidateVideoUrlTests(unittest.TestCase):
 
     def test_rejects_wrong_host_or_scheme(self):
         self.assertIsNone(feed_api.validate_video_url("https://evil.example/x.mp4"))
-        self.assertIsNone(feed_api.validate_video_url(f"http://cdn-mctchildfoliocn.childfolio.net/x.mp4"))
+        self.assertIsNone(feed_api.validate_video_url(f"http://example.invalid/x.mp4"))
 
 
 class ExtractMomentsTests(unittest.TestCase):
