@@ -11,7 +11,9 @@ from tools import export_originals as eo
 from tools import feed_api
 
 
-CDN = "https://cdn-mctchildfoliocn.childfolio.net"
+# Reserved documentation-only host: tests must never contain a real service
+# host or a real child/provider identifier.
+CDN = "https://example.invalid"
 
 
 def _pic(date: str, name: str) -> str:

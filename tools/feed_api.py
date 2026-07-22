@@ -141,7 +141,7 @@ def validate_video_url(raw: str) -> str | None:
         parsed = urllib.parse.urlsplit(raw)
     except ValueError:
         return None
-    if parsed.scheme != "https" or parsed.hostname != eo.CDN_HOST:
+    if parsed.scheme != "https" or parsed.hostname not in eo.ALLOWED_CDN_HOSTS:
         return None
     if parsed.username or parsed.password:
         return None

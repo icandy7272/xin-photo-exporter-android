@@ -25,6 +25,10 @@ import urllib.request
 
 
 CDN_HOST = "cdn-mctchildfoliocn.childfolio.net"
+# `example.invalid` is reserved for offline tests and cannot resolve on the
+# public DNS. Keep it separate from the production host so tests never need a
+# real CDN hostname while URL validation remains strict.
+ALLOWED_CDN_HOSTS = frozenset((CDN_HOST, "example.invalid"))
 MUMUTOOL = Path("/Applications/MuMuPlayer.app/Contents/MacOS/mumutool")
 ADB = Path(
     "/Applications/MuMuPlayer.app/Contents/MacOS/"
@@ -115,7 +119,7 @@ def validate_original_url(raw: str) -> str | None:
         return None
     if parsed.scheme != "https":
         return None
-    if parsed.hostname != CDN_HOST or port not in (None, 443):
+    if parsed.hostname not in ALLOWED_CDN_HOSTS or port not in (None, 443):
         return None
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         return None

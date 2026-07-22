@@ -143,6 +143,9 @@ python3 tools/export_originals.py api --yes
 - 登录凭证（token）只在你电脑内存里用来调用**你自己账号**的接口，**绝不打印、不保存、不上传**。
 - 导出的照片 / 视频 / 文字**只存在你电脑本地** `build/` 目录，工具不向任何服务器上传内容。
 - `build/` 已在 `.gitignore` 中，即使你用 git，也不会把私人内容传到网上。
+- 不要把 `build/`、完整媒体 URL、请求日志、模拟器数据目录、截图或包含 `childId`/园所标识的配置文件上传到 GitHub、Issue、网盘或聊天工具。
+- 测试代码只使用 `example.invalid` 和虚构 ID；真实 childId、provider ID、Cookie、access token 和 Authorization 头都不得写入源码、测试夹具或提交历史。
+- 如果登录态曾出现在日志、截图或提交中，应立即在鑫时光集里退出并重新登录；仅仅删除本地文件不能撤回已经复制出去的凭证。
 - 本工具使用的是 App 的**非官方接口**（通过技术手段分析得到）。App 若大改版本，接口可能失效。
 
 ---
