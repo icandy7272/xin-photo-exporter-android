@@ -11,7 +11,8 @@ with a Bearer token, ``client: fa_app`` / ``lang`` headers and a body of
 ``{childIds, counter, paChildIds}``. Each moment carries
 ``pictureURLs`` (original .jpeg), ``videoUrl``, ``momentCaption`` (post
 text) and ``publishedTime``; pagination is a ``counter`` cursor plus
-``hasMore``.
+``hasMore``. ``childIds`` must list *every* child of the account: the
+server ends the feed at the oldest post of the ids it was given.
 
 This module only pulls the JSON feed (no image rendering), so it stays
 low-memory and reaches the whole library without the emulator crashing.
@@ -59,8 +60,9 @@ _PREF_STRING_RE = r'<string name="{key}">([^<]*)</string>'
 _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
-# album_child_id is only set once the album is opened; childIds/paChildIds hold
-# the same id (as a JSON array) right after login, so fall back to them.
+# album_child_id is only set once the album is opened, and holds just the open
+# album. childIds/paChildIds are JSON arrays holding *every* child of the
+# account, so all three keys are read and unioned (see extract_child_ids).
 _CHILD_ID_KEYS = ("album_child_id", "childIds", "paChildIds")
 
 VIDEO_EXTS = (".mp4", ".mov", ".m4v")
@@ -102,21 +104,29 @@ def extract_pref_string(prefs_xml: str, key: str) -> str | None:
     return match.group(1) or None
 
 
-def extract_child_id(prefs_xml: str) -> str | None:
-    """Find the child UUID from album_child_id / childIds / paChildIds."""
+def extract_child_ids(prefs_xml: str) -> tuple[str, ...]:
+    """Find every child UUID in album_child_id / childIds / paChildIds.
+
+    An account can hold more than one child record - a sibling, or the same
+    child re-enrolled under a new record. The app merges their timelines, so
+    the exporter must ask for all of them: requesting only the first ends the
+    feed at that record's oldest post and silently loses the earlier years.
+    """
+    found: list[str] = []
     for key in _CHILD_ID_KEYS:
         value = extract_pref_string(prefs_xml, key)
-        if value:
-            match = _UUID_RE.search(value)
-            if match:
-                return match.group(0)
-    return None
+        if not value:
+            continue
+        for child_id in _UUID_RE.findall(value):
+            if child_id not in found:
+                found.append(child_id)
+    return tuple(found)
 
 
 def read_app_credentials(
     device: "eo.Device", run_command: Callable = eo.run_command
-) -> tuple[str, str]:
-    """Read the Bearer token and album child id from the app's prefs."""
+) -> tuple[str, tuple[str, ...]]:
+    """Read the Bearer token and every child id from the app's prefs."""
     result = run_command(
         [
             eo.ADB,
@@ -129,10 +139,10 @@ def read_app_credentials(
     if result.returncode != 0:
         raise eo.SmokeError("prefs-read-failed")
     token = extract_pref_string(result.stdout, "accessToken")
-    child_id = extract_child_id(result.stdout)
-    if not token or not child_id:
+    child_ids = extract_child_ids(result.stdout)
+    if not token or not child_ids:
         raise eo.SmokeError("credentials-not-found")
-    return token, child_id
+    return token, child_ids
 
 
 def validate_video_url(raw: str) -> str | None:
@@ -198,8 +208,8 @@ def _page_pagination(payload: object) -> tuple[bool, int | None]:
 
 
 def collect_moments(
-    post_page: Callable[[str, int], object],
-    child_id: str,
+    post_page: Callable[[tuple[str, ...], int], object],
+    child_ids: tuple[str, ...],
     *,
     initial_counter: int = COUNTER_SEED,
     max_pages: int = DEFAULT_MAX_PAGES,
@@ -218,7 +228,7 @@ def collect_moments(
     counter = initial_counter
     try:
         for _ in range(max_pages):
-            payload = post_page(child_id, counter)
+            payload = post_page(child_ids, counter)
             for record in extract_moments(payload):
                 if record.moment_id and record.moment_id in seen_ids:
                     continue
@@ -248,8 +258,8 @@ def unique_picture_urls(records: list[MomentRecord]) -> list[str]:
 
 
 def collect_api_urls(
-    post_page: Callable[[str, int], object],
-    child_id: str,
+    post_page: Callable[[tuple[str, ...], int], object],
+    child_ids: tuple[str, ...],
     *,
     initial_counter: int = COUNTER_SEED,
     max_pages: int = DEFAULT_MAX_PAGES,
@@ -259,7 +269,7 @@ def collect_api_urls(
     return unique_picture_urls(
         collect_moments(
             post_page,
-            child_id,
+            child_ids,
             initial_counter=initial_counter,
             max_pages=max_pages,
             progress=progress,
@@ -297,11 +307,12 @@ def find_start_counter(
 
 
 def fetch_moment_page(
-    opener, token: str, child_id: str, counter: int, timeout: int = 30
+    opener, token: str, child_ids: tuple[str, ...], counter: int, timeout: int = 30
 ) -> object:
-    """POST one feed page and return the parsed JSON payload."""
+    """POST one feed page for all children and return the parsed payload."""
+    ids = list(child_ids)
     body = json.dumps(
-        {"childIds": [child_id], "counter": counter, "paChildIds": [child_id]}
+        {"childIds": ids, "counter": counter, "paChildIds": ids}
     ).encode("utf-8")
     request = urllib.request.Request(
         API_BASE + FEED_PATH,
@@ -511,17 +522,18 @@ def run_api(
     """Collect the whole feed, save post text, then confirm and download."""
     try:
         device = eo.discover_running_device(run_command)
-        token, child_id = read_app_credentials(device, run_command)
+        token, child_ids = read_app_credentials(device, run_command)
         opener = opener or eo.build_opener()
+        print(f"账号下共 {len(child_ids)} 个孩子档案，一起拉取。")
 
-        def post_page(cid: str, counter: int) -> object:
-            return fetch_moment_page(opener, token, cid, counter)
+        def post_page(cids: tuple[str, ...], counter: int) -> object:
+            return fetch_moment_page(opener, token, cids, counter)
 
         if initial_counter is None:
             print("定位最新游标中（二分探测）…")
 
             def has_data(counter: int) -> bool:
-                payload = post_page(child_id, counter)
+                payload = post_page(child_ids, counter)
                 data = payload.get("data") if isinstance(payload, dict) else None
                 moments = data.get("momentList") if isinstance(data, dict) else None
                 return bool(moments)
@@ -530,7 +542,7 @@ def run_api(
             if initial_counter is None:
                 raise eo.SmokeError("counter-seed-empty")
         print("直连 API 采集中（翻页拉取，不经模拟器渲染）…")
-        records = collect_moments(post_page, child_id, initial_counter=initial_counter)
+        records = collect_moments(post_page, child_ids, initial_counter=initial_counter)
         photo_urls = unique_picture_urls(records)
         video_total = sum(1 for record in records if record.video_url)
         print(

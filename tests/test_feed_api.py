@@ -202,6 +202,28 @@ class CollectApiUrlsTests(unittest.TestCase):
 
 
 _UUID = "00000000-0000-4000-8000-000000000000"
+_UUID2 = "00000000-0000-4000-8000-000000000001"
+
+
+class ExtractChildIdsTests(unittest.TestCase):
+    def test_returns_every_child_in_the_account(self):
+        # A parent account can hold more than one child record (a sibling, or
+        # the same child re-enrolled). Missing one truncates the feed.
+        xml = f'<string name="childIds">["{_UUID}","{_UUID2}"]</string>'
+        self.assertEqual(feed_api.extract_child_ids(xml), (_UUID, _UUID2))
+
+    def test_unions_keys_without_dropping_ids(self):
+        # album_child_id holds only the open album; childIds holds them all.
+        xml = (
+            f'<string name="album_child_id">{_UUID2}</string>'
+            f'<string name="childIds">["{_UUID}","{_UUID2}"]</string>'
+            f'<string name="paChildIds">["{_UUID}","{_UUID2}"]</string>'
+        )
+        self.assertEqual(set(feed_api.extract_child_ids(xml)), {_UUID, _UUID2})
+        self.assertEqual(len(feed_api.extract_child_ids(xml)), 2)
+
+    def test_no_children_returns_empty(self):
+        self.assertEqual(feed_api.extract_child_ids("<map/>"), ())
 
 
 class ReadCredentialsTests(unittest.TestCase):
@@ -210,10 +232,10 @@ class ReadCredentialsTests(unittest.TestCase):
             f'<string name="accessToken">tok</string>'
             f'<string name="album_child_id">{_UUID}</string>'
         )
-        token, child = feed_api.read_app_credentials(
+        token, children = feed_api.read_app_credentials(
             eo.Device("127.0.0.1:1"), run_command=lambda argv: _completed(xml)
         )
-        self.assertEqual((token, child), ("tok", _UUID))
+        self.assertEqual((token, children), ("tok", (_UUID,)))
 
     def test_falls_back_to_child_ids_after_login(self):
         # album_child_id empty right after login; childIds holds the id.
@@ -222,10 +244,20 @@ class ReadCredentialsTests(unittest.TestCase):
             f'<string name="album_child_id"></string>'
             f'<string name="childIds">["{_UUID}"]</string>'
         )
-        token, child = feed_api.read_app_credentials(
+        token, children = feed_api.read_app_credentials(
             eo.Device("s"), run_command=lambda argv: _completed(xml)
         )
-        self.assertEqual((token, child), ("tok", _UUID))
+        self.assertEqual((token, children), ("tok", (_UUID,)))
+
+    def test_reads_every_child_not_just_the_first(self):
+        xml = (
+            f'<string name="accessToken">tok</string>'
+            f'<string name="childIds">["{_UUID}","{_UUID2}"]</string>'
+        )
+        _, children = feed_api.read_app_credentials(
+            eo.Device("s"), run_command=lambda argv: _completed(xml)
+        )
+        self.assertEqual(children, (_UUID, _UUID2))
 
     def test_missing_child_id_raises(self):
         xml = '<string name="accessToken">tok</string>'
@@ -267,12 +299,18 @@ class FetchMomentPageTests(unittest.TestCase):
                 captured["headers"] = dict(request.headers)
                 return _Resp(200, json.dumps({"data": {"hasMore": False}}).encode())
 
-        payload = feed_api.fetch_moment_page(Opener(), "tok", "cid", 42)
+        payload = feed_api.fetch_moment_page(Opener(), "tok", ("cid1", "cid2"), 42)
         self.assertEqual(payload, {"data": {"hasMore": False}})
         self.assertIn("getPageMomentList", captured["url"])
+        # Every child of the account goes in one request, so the server merges
+        # their timelines instead of ending at the first child's oldest post.
         self.assertEqual(
             json.loads(captured["data"]),
-            {"childIds": ["cid"], "counter": 42, "paChildIds": ["cid"]},
+            {
+                "childIds": ["cid1", "cid2"],
+                "counter": 42,
+                "paChildIds": ["cid1", "cid2"],
+            },
         )
         self.assertEqual(captured["headers"].get("Client"), "fa_app")
         self.assertEqual(captured["headers"].get("Authorization"), "Bearer tok")
@@ -283,7 +321,7 @@ class FetchMomentPageTests(unittest.TestCase):
                 return _Resp(500)
 
         with self.assertRaises(eo.SmokeError):
-            feed_api.fetch_moment_page(Opener(), "t", "c", 1)
+            feed_api.fetch_moment_page(Opener(), "t", ("c",), 1)
 
 
 class VideoDestinationTests(unittest.TestCase):
@@ -485,6 +523,29 @@ class RunApiTests(unittest.TestCase):
         rc, wm, wc, dv = self._run(page, input_answer="", assume_yes=True, downloader=downloader)
         self.assertEqual(rc, 0)
         self.assertEqual(called["n"], 1)
+
+    def test_requests_every_child_of_the_account(self):
+        page = _payload([_moment(momentId="m1", pictureURLs=[_pic("2024-01-02", "a")])])
+        with mock.patch.object(eo, "discover_running_device", return_value=eo.Device("s")), \
+                mock.patch.object(feed_api, "fetch_moment_page", return_value=page) as fetch, \
+                mock.patch.object(eo, "ensure_build_is_ignored"), \
+                mock.patch.object(feed_api, "write_manifest", return_value=1), \
+                mock.patch.object(feed_api, "write_captions", return_value=1), \
+                mock.patch.object(feed_api, "download_videos",
+                                  return_value=feed_api.VideoSummary(0, 0, 0, 0)):
+            xml = (
+                f'<string name="accessToken">tok</string>'
+                f'<string name="childIds">["{_UUID}","{_UUID2}"]</string>'
+            )
+            with redirect_stdout(io.StringIO()):
+                feed_api.run_api(
+                    run_command=lambda argv: _completed(xml),
+                    opener=object(),
+                    assume_yes=True,
+                    downloader=lambda urls, out: eo.BatchSummary(1, 1, 0, 0, 0, 0),
+                    initial_counter=feed_api.COUNTER_SEED,
+                )
+        self.assertEqual(fetch.call_args.args[2], (_UUID, _UUID2))
 
     def test_no_records_returns_zero(self):
         rc, wm, wc, dv = self._run(_payload([]))
