@@ -39,7 +39,8 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MIN_BYTES = 1024
 MAX_BYTES = 50 * 1024 * 1024
 CHUNK_BYTES = 64 * 1024
-# Content photos are jpeg/jpg or png (all seen on the CDN, no query).
+# Content photos are jpeg/jpg or png (all seen on the CDN, no query);
+# the extension may be upper- or lower-case, so compare lower-cased.
 IMAGE_EXTS = (".jpeg", ".jpg", ".png")
 ALLOWED_IMAGE_TYPES = ("image/jpeg", "image/png")
 IMAGE_MAGIC = (b"\xff\xd8", b"\x89P")  # JPEG, PNG
@@ -123,7 +124,8 @@ def validate_original_url(raw: str) -> str | None:
         return None
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         return None
-    if not parsed.path.endswith(IMAGE_EXTS):
+    # Case-insensitive: older uploads kept the camera's ".JPG".
+    if not parsed.path.lower().endswith(IMAGE_EXTS):
         return None
     return raw
 

@@ -23,6 +23,13 @@ class ValidateOriginalUrlTests(unittest.TestCase):
             url = f"https://{HOST}/provider/1/moments/images/2026-04-17/a.{ext}"
             self.assertEqual(eo.validate_original_url(url), url)
 
+    def test_accepts_uppercase_extension(self):
+        # Some older uploads kept the camera's ".JPG"; the extension check must
+        # not be case-sensitive or those photos are silently skipped.
+        for ext in ("JPG", "JPEG", "PNG", "Jpg"):
+            url = f"https://{HOST}/provider/1/moments/images/2022-09-01/a.{ext}"
+            self.assertEqual(eo.validate_original_url(url), url)
+
     def test_rejects_unsafe_or_wrong_format(self):
         for url in [
             f"http://{HOST}/a.jpeg",  # scheme
