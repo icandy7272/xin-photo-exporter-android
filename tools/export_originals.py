@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import json
 import os
@@ -43,6 +44,10 @@ CHUNK_BYTES = 64 * 1024
 # the extension may be upper- or lower-case, so compare lower-cased.
 IMAGE_EXTS = (".jpeg", ".jpg", ".png")
 ALLOWED_IMAGE_TYPES = ("image/jpeg", "image/png")
+# The oldest uploads are served with a generic binary type instead of an image
+# one. IMAGE_MAGIC below is what actually proves the body is an image, so these
+# are accepted and left for that check rather than rejected on the header.
+GENERIC_BINARY_TYPES = ("application/octet-stream", "binary/octet-stream")
 IMAGE_MAGIC = (b"\xff\xd8", b"\x89P")  # JPEG, PNG
 SYSTEM_CA_FILE = Path("/etc/ssl/cert.pem")
 SETFILE = Path("/usr/bin/SetFile")
@@ -69,6 +74,7 @@ class DownloadResult:
 class CandidateOutcome:
     status: str
     date_failed: bool = False
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,8 @@ class BatchSummary:
     failed: int
     date_failed: int
     unprocessed: int
+    # (reason, count) for the files that failed every pass, most common first.
+    failure_reasons: tuple[tuple[str, int], ...] = ()
 
 
 class RejectRedirects(urllib.request.HTTPRedirectHandler):
@@ -240,7 +248,7 @@ def download_sample(
             content_type = (
                 response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
             )
-            if content_type not in ALLOWED_IMAGE_TYPES:
+            if content_type not in ALLOWED_IMAGE_TYPES + GENERIC_BINARY_TYPES:
                 raise SmokeError("wrong-content-type")
             with part.open("xb") as output:
                 while True:
@@ -298,8 +306,8 @@ def download_batch_candidate(
         return CandidateOutcome("existing", date_failed=not date_ok)
     try:
         download_sample(opener, url, destination)
-    except SmokeError:
-        return CandidateOutcome("failed")
+    except SmokeError as exc:
+        return CandidateOutcome("failed", reason=str(exc))
     try:
         date_ok = date_setter(destination, record_date)
     except Exception:
@@ -325,6 +333,7 @@ def download_batch(
     existing = 0
     failed = 0
     date_failed = 0
+    reasons: collections.Counter[str] = collections.Counter()
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
         pending = candidates
@@ -352,6 +361,7 @@ def download_batch(
                         failed,
                         date_failed,
                         unprocessed,
+                        tuple(reasons.most_common()),
                     )
                     _print_batch_summary(summary, output_dir)
                     return summary
@@ -363,11 +373,18 @@ def download_batch(
                     date_failed += int(outcome.date_failed)
                 elif pass_index == 2:
                     failed += 1
+                    reasons[outcome.reason or "unknown"] += 1
                 else:
                     next_pending.append(url)
             pending = next_pending
         summary = BatchSummary(
-            len(candidates), downloaded, existing, failed, date_failed, 0
+            len(candidates),
+            downloaded,
+            existing,
+            failed,
+            date_failed,
+            0,
+            tuple(reasons.most_common()),
         )
         _print_batch_summary(summary, output_dir)
         return summary
@@ -382,6 +399,8 @@ def _print_batch_summary(summary: BatchSummary, output_dir: Path) -> None:
         f"失败 {summary.failed}，日期设置失败 {summary.date_failed}，"
         f"未处理 {summary.unprocessed}"
     )
+    for reason, count in summary.failure_reasons:
+        print(f"  失败原因：{reason} × {count}")
     print(f"输出目录：{output_dir}")
 
 

@@ -197,6 +197,28 @@ class DownloadSampleTests(unittest.TestCase):
                 self.assertFalse(dest.exists())
                 self.assertFalse(dest.with_suffix(".jpeg.part").exists())
 
+    def test_accepts_generic_binary_content_type(self):
+        # The oldest uploads are served as application/octet-stream rather than
+        # image/jpeg. The magic-byte check below is what actually proves it is
+        # an image, so a generic binary type must not be rejected outright.
+        for ctype in ("application/octet-stream", "binary/octet-stream"):
+            with tempfile.TemporaryDirectory() as temp:
+                dest = Path(temp) / "a.jpeg"
+                opener = FakeOpener([FakeResponse(self.JPEG, content_type=ctype)])
+                eo.download_sample(opener, "https://x/a.jpg", dest)
+                self.assertEqual(dest.read_bytes(), self.JPEG)
+
+    def test_generic_binary_still_needs_image_magic(self):
+        # Relaxing the content-type must not weaken the real guard.
+        with tempfile.TemporaryDirectory() as temp:
+            dest = Path(temp) / "a.jpeg"
+            opener = FakeOpener(
+                [FakeResponse(b"<html>" + b"x" * 2048, content_type="application/octet-stream")]
+            )
+            with self.assertRaises(eo.SmokeError):
+                eo.download_sample(opener, "https://x/a.jpg", dest)
+            self.assertFalse(dest.exists())
+
     def test_over_limit_removed(self):
         big = b"\xff\xd8" + b"x" * (eo.MAX_BYTES + 10)
         with tempfile.TemporaryDirectory() as temp:
@@ -287,6 +309,59 @@ class DownloadBatchTests(unittest.TestCase):
         self.assertEqual(summary.failed, 1)
         # "bad" is retried across all three passes.
         self.assertEqual(attempts.count("bad"), 3)
+
+
+class FailureReasonTests(unittest.TestCase):
+    def test_candidate_carries_the_reason(self):
+        def boom(opener, url, destination):
+            raise eo.SmokeError("wrong-content-type")
+
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.object(eo, "download_sample", side_effect=boom):
+                outcome = eo.download_batch_candidate(
+                    "https://x/a.jpeg", Path(temp), opener=object()
+                )
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.reason, "wrong-content-type")
+
+    def test_summary_aggregates_reasons_and_prints_them(self):
+        reasons = {"a": "wrong-content-type", "b": "wrong-content-type", "c": "http-not-200"}
+
+        def downloader(url, output_dir, *, opener, date_setter):
+            return eo.CandidateOutcome("failed", reason=reasons[url])
+
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.object(eo, "ensure_build_is_ignored"):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    summary = eo.download_batch(
+                        ["a", "b", "c"],
+                        Path(temp),
+                        opener=object(),
+                        sleep_fn=lambda s: None,
+                        candidate_downloader=downloader,
+                    )
+        self.assertEqual(summary.failed, 3)
+        # Ordered most-common-first so the dominant cause is obvious.
+        self.assertEqual(
+            summary.failure_reasons, (("wrong-content-type", 2), ("http-not-200", 1))
+        )
+        printed = out.getvalue()
+        self.assertIn("wrong-content-type", printed)
+        self.assertIn("http-not-200", printed)
+
+    def test_no_failures_means_no_reasons(self):
+        def downloader(url, output_dir, *, opener, date_setter):
+            return eo.CandidateOutcome("downloaded")
+
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.object(eo, "ensure_build_is_ignored"):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    summary = eo.download_batch(
+                        ["a"], Path(temp), opener=object(),
+                        sleep_fn=lambda s: None, candidate_downloader=downloader,
+                    )
+        self.assertEqual(summary.failure_reasons, ())
 
 
 class ConfirmDownloadTests(unittest.TestCase):
