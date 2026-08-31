@@ -112,7 +112,7 @@ class NormaliseChildIdsTests(unittest.TestCase):
 
 class ResolveCredentialsTests(unittest.TestCase):
     def _prefs(self):
-        return f'<string name="accessToken">tok</string><string name="album_child_id">{_UUID}</string>'
+        return f'<map><string name="accessToken">tok</string><string name="album_child_id">{_UUID}</string>'
 
     def test_token_and_child_ids_given_skips_the_device(self):
         def read_prefs():
@@ -150,7 +150,7 @@ class ResolveCredentialsTests(unittest.TestCase):
 class ReadCredentialsTests(unittest.TestCase):
     def test_reads_token_and_album_child_id(self):
         xml = (
-            f'<string name="accessToken">tok</string>'
+            f'<map><string name="accessToken">tok</string>'
             f'<string name="album_child_id">{_UUID}</string>'
         )
         token, children = creds.read_app_credentials(
@@ -161,7 +161,7 @@ class ReadCredentialsTests(unittest.TestCase):
     def test_falls_back_to_child_ids_after_login(self):
         # album_child_id empty right after login; childIds holds the id.
         xml = (
-            f'<string name="accessToken">tok</string>'
+            f'<map><string name="accessToken">tok</string>'
             f'<string name="album_child_id"></string>'
             f'<string name="childIds">["{_UUID}"]</string>'
         )
@@ -172,7 +172,7 @@ class ReadCredentialsTests(unittest.TestCase):
 
     def test_reads_every_child_not_just_the_first(self):
         xml = (
-            f'<string name="accessToken">tok</string>'
+            f'<map><string name="accessToken">tok</string>'
             f'<string name="childIds">["{_UUID}","{_UUID2}"]</string>'
         )
         _, children = creds.read_app_credentials(
@@ -181,7 +181,7 @@ class ReadCredentialsTests(unittest.TestCase):
         self.assertEqual(children, (_UUID, _UUID2))
 
     def test_missing_child_id_raises(self):
-        xml = '<string name="accessToken">tok</string>'
+        xml = '<map><string name="accessToken">tok</string>'
         with self.assertRaises(eo.SmokeError):
             creds.read_app_credentials(eo.Device("s"), run_command=lambda argv: _completed(xml))
 
@@ -190,6 +190,53 @@ class ReadCredentialsTests(unittest.TestCase):
             creds.read_app_credentials(
                 eo.Device("s"), run_command=lambda argv: _completed("", returncode=1)
             )
+
+class TokenFileInRepositoryTests(unittest.TestCase):
+    """A token is账号-equivalent: refuse to read one from inside the repo.
+
+    Only build/ is gitignored, so a token file dropped anywhere else in the
+    checkout is one `git add .` away from being published forever.
+    """
+
+    def test_token_file_inside_the_repository_is_refused(self):
+        path = eo.REPOSITORY_ROOT / "token.txt"
+        path.write_text("tok-abc", encoding="utf-8")
+        try:
+            with self.assertRaises(eo.SmokeError) as caught:
+                creds.load_token(token_file=path, env={})
+            self.assertEqual(str(caught.exception), "token-file-in-repository")
+        finally:
+            path.unlink()
+
+    def test_nested_inside_the_repository_is_also_refused(self):
+        directory = eo.REPOSITORY_ROOT / "tools"
+        path = directory / "my-token.txt"
+        path.write_text("tok-abc", encoding="utf-8")
+        try:
+            with self.assertRaises(eo.SmokeError):
+                creds.load_token(token_file=path, env={})
+        finally:
+            path.unlink()
+
+    def test_outside_the_repository_is_fine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "token.txt"
+            path.write_text("tok-abc", encoding="utf-8")
+            self.assertEqual(creds.load_token(token_file=path, env={}), "tok-abc")
+
+    def test_the_build_directory_is_still_refused(self):
+        # build/ is gitignored, but a credential does not belong in the
+        # checkout at all - one wrong -f flag and it ships.
+        directory = eo.REPOSITORY_ROOT / "build"
+        directory.mkdir(exist_ok=True)
+        path = directory / "token.txt"
+        path.write_text("tok-abc", encoding="utf-8")
+        try:
+            with self.assertRaises(eo.SmokeError):
+                creds.load_token(token_file=path, env={})
+        finally:
+            path.unlink()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,11 +7,29 @@ from tools import export_originals as eo
 
 
 UUID = "11111111-2222-3333-4444-555555555555"
-PREFS = f'<string name="accessToken">tok</string><string name="album_child_id">{UUID}</string>'
+# Real shared_prefs always have a <map> root; the fixtures used to omit it,
+# which is exactly why the "app installed but not logged in" case was
+# misdiagnosed as a root failure.
+PREFS = (
+    "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>"
+    f'<string name="accessToken">tok</string>'
+    f'<string name="album_child_id">{UUID}</string>'
+    "</map>"
+)
+# The app installed and opened, but nobody has logged in yet: a valid prefs
+# file that simply holds no strings. Observed on a real emulator.
+PREFS_NO_LOGIN = (
+    "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n"
+    '<map>\n    <boolean name="hadAccessProto" value="true" />\n</map>'
+)
+DENIED = "cat: /data/data/x/shared_prefs/*.xml: Permission denied"
+NOT_FOUND = "cat: /data/data/x/shared_prefs/*.xml: No such file or directory"
 
 
-def _completed(stdout: str, returncode: int = 0):
-    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+def _completed(stdout: str, returncode: int = 0, stderr: str = ""):
+    return subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr
+    )
 
 
 class AdbCandidateTests(unittest.TestCase):
@@ -214,10 +232,31 @@ class ReadPrefsTests(unittest.TestCase):
 
         self.assertIn("accessToken", device.read_prefs_xml(self._device(), "pkg", run))
 
-    def test_every_attempt_failing_raises(self):
+    def test_permission_denied_everywhere_is_a_root_problem(self):
         with self.assertRaises(eo.SmokeError) as caught:
-            device.read_prefs_xml(self._device(), "pkg", lambda argv: _completed("denied", 1))
+            device.read_prefs_xml(
+                self._device(), "pkg", lambda argv: _completed("", 1, stderr=DENIED)
+            )
         self.assertEqual(str(caught.exception), "prefs-read-failed")
+
+    def test_prefs_without_strings_is_not_a_read_failure(self):
+        """App installed and opened, but not logged in yet.
+
+        The read succeeded - there is simply no credential in it. Calling
+        that a read failure sends the user off to rebuild their emulator
+        instead of just logging in.
+        """
+        xml = device.read_prefs_xml(
+            self._device(), "pkg", lambda argv: _completed(PREFS_NO_LOGIN)
+        )
+        self.assertIn("hadAccessProto", xml)
+
+    def test_missing_prefs_reports_missing_credentials_not_a_root_problem(self):
+        with self.assertRaises(eo.SmokeError) as caught:
+            device.read_prefs_xml(
+                self._device(), "pkg", lambda argv: _completed("", 1, stderr=NOT_FOUND)
+            )
+        self.assertEqual(str(caught.exception), "credentials-not-found")
 
     def test_network_serial_reconnects_after_root(self):
         calls: list[list[str]] = []

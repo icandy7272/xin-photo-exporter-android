@@ -420,7 +420,7 @@ class WriteCaptionsTests(unittest.TestCase):
 class RunApiTests(unittest.TestCase):
     def _creds(self):
         return _completed(
-            f'<string name="accessToken">tok</string>'
+            f'<map><string name="accessToken">tok</string>'
             f'<string name="album_child_id">{_UUID}</string>'
         )
 
@@ -512,7 +512,7 @@ class RunApiTests(unittest.TestCase):
                 mock.patch.object(feed_api, "download_videos",
                                   return_value=feed_api.VideoSummary(0, 0, 0, 0)):
             xml = (
-                f'<string name="accessToken">tok</string>'
+                f'<map><string name="accessToken">tok</string>'
                 f'<string name="childIds">["{_UUID}","{_UUID2}"]</string>'
             )
             with redirect_stdout(io.StringIO()):
@@ -586,7 +586,7 @@ class FindStartCounterTests(unittest.TestCase):
                 rc = feed_api.run_api(
                     run_command=lambda argv: subprocess.CompletedProcess(
                         [], 0,
-                        f'<string name="accessToken">t</string>'
+                        f'<map><string name="accessToken">t</string>'
                         f'<string name="album_child_id">{_UUID}</string>', "",
                     ),
                     opener=object(),
@@ -757,7 +757,7 @@ class RunApiCredentialSourceTests(unittest.TestCase):
 
     def test_missing_token_falls_back_to_the_device(self):
         prefs = _completed(
-            f'<string name="accessToken">tok-device</string><string name="album_child_id">{_UUID}</string>'
+            f'<map><string name="accessToken">tok-device</string><string name="album_child_id">{_UUID}</string>'
         )
         with mock.patch.object(feed_api.creds.android, "find_adb", return_value=Path("adb")), \
                 mock.patch.object(feed_api.creds.android, "discover_device", return_value=eo.Device("s")):
@@ -812,7 +812,7 @@ class RunListChildrenTests(unittest.TestCase):
     def test_prints_every_child_id(self):
         other = "99999999-8888-7777-6666-555555555555"
         xml = (
-            '<string name="accessToken">tok</string>'
+            '<map><string name="accessToken">tok</string>'
             f'<string name="childIds">["{_UUID}","{other}"]</string>'
         )
         lines: list[str] = []

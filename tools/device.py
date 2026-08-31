@@ -41,10 +41,16 @@ SDK_DEFAULT_DIRS = (
 # devices answer nothing useful, so they are filtered out rather than picked.
 READY_STATE = "device"
 PREFS_GLOB = "shared_prefs/*.xml"
-# A successful read always contains at least one <string> pref. `adb shell`
-# does not reliably forward the remote exit code, so the payload - not the
-# return code - is what proves the read worked.
-PREFS_MARKER = "<string"
+# Every SharedPreferences file is rooted in <map>, whatever it holds - so
+# that, not a <string> entry, is what proves the read itself worked. A file
+# with no strings means "installed but not logged in", which is a different
+# problem from "cannot read /data/data" and must not be reported as one.
+# `adb shell` does not reliably forward the remote exit code, so the payload
+# is the only trustworthy signal.
+PREFS_MARKER = "<map"
+# Only a refusal points at root/image trouble; "no such file" just means the
+# app has not been opened yet.
+DENIED_MARKERS = ("permission denied", "operation not permitted", "inaccessible")
 
 
 def _dedupe(paths: Iterable[Path]) -> tuple[Path, ...]:
@@ -157,9 +163,14 @@ def discover_device(
     return eo.Device(serial=serials[0], adb=adb)
 
 
-def _shell(device: eo.Device, command: str, run_command: Callable) -> str:
+def _shell(device: eo.Device, command: str, run_command: Callable) -> tuple[str, str]:
+    """Run one adb shell command; return (stdout, stderr).
+
+    stderr matters: "Permission denied" is the only thing that distinguishes
+    a root problem from an app that was simply never opened.
+    """
     result = run_command([device.adb, "-s", device.serial, "shell", command])
-    return result.stdout or ""
+    return result.stdout or "", result.stderr or ""
 
 
 def _restart_adbd_as_root(device: eo.Device, run_command: Callable) -> None:
@@ -175,21 +186,38 @@ def _restart_adbd_as_root(device: eo.Device, run_command: Callable) -> None:
     run_command([device.adb, "-s", device.serial, "wait-for-device"])
 
 
+def _looks_denied(messages: str) -> bool:
+    lowered = messages.lower()
+    return any(marker in lowered for marker in DENIED_MARKERS)
+
+
 def read_prefs_xml(
     device: eo.Device,
     package: str = eo.PACKAGE,
     run_command: Callable = eo.run_command,
 ) -> str:
-    """Return the app's shared_prefs XML, escalating privileges as needed."""
+    """Return the app's shared_prefs XML, escalating privileges as needed.
+
+    Separates the two failures a user can actually act on: a device that
+    refuses to hand over /data/data (wrong emulator image, or Root not
+    enabled) versus an app that was never opened and logged into. Reporting
+    the second as the first sends people off to rebuild their emulator when
+    all they had to do was log in.
+    """
     read = f"cat /data/data/{package}/{PREFS_GLOB}"
-    output = _shell(device, read, run_command)
-    if PREFS_MARKER in output:
-        return output
-    _restart_adbd_as_root(device, run_command)
-    output = _shell(device, read, run_command)
-    if PREFS_MARKER in output:
-        return output
-    output = _shell(device, f"su -c '{read}'", run_command)
-    if PREFS_MARKER in output:
-        return output
-    raise eo.SmokeError("prefs-read-failed")
+    complaints: list[str] = []
+    attempts = (
+        lambda: None,
+        lambda: _restart_adbd_as_root(device, run_command),
+        lambda: None,
+    )
+    commands = (read, read, f"su -c '{read}'")
+    for prepare, command in zip(attempts, commands):
+        prepare()
+        output, errors = _shell(device, command, run_command)
+        if PREFS_MARKER in output:
+            return output
+        complaints.append(errors or output)
+    if _looks_denied("\n".join(complaints)):
+        raise eo.SmokeError("prefs-read-failed")
+    raise eo.SmokeError("credentials-not-found")

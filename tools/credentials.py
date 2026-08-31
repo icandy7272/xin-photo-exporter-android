@@ -80,6 +80,22 @@ def read_app_credentials(
     return token, child_ids
 
 
+def _refuse_token_inside_repository(token_file: Path) -> None:
+    """Reject a token stored inside the checkout.
+
+    The token is account-equivalent - it calls the API with no password and
+    no SMS code - and only ``build/`` is gitignored, so a token file left
+    anywhere else here is one ``git add .`` from being published. Git never
+    forgets: deleting the file later does not remove it from history, and
+    anyone who already cloned keeps their copy. Keep it outside the repo.
+    """
+    try:
+        token_file.resolve().relative_to(eo.REPOSITORY_ROOT)
+    except (ValueError, OSError):
+        return
+    raise eo.SmokeError("token-file-in-repository")
+
+
 def load_token(
     token_file: Path | None = None, env: Mapping[str, str] | None = None
 ) -> str | None:
@@ -90,6 +106,7 @@ def load_token(
     """
     env = os.environ if env is None else env
     if token_file is not None:
+        _refuse_token_inside_repository(Path(token_file))
         try:
             raw = Path(token_file).read_text(encoding="utf-8")
         except OSError:
