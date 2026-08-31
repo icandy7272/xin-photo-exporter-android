@@ -2,7 +2,8 @@
 
 把你自己「鑫时光集家长版」账号里的**全部照片、视频、帖子文字**，一次性备份到你的 Mac 电脑。全程只读**你自己的账号**、只在本机处理，**不上传到任何地方**。适合想长期保存孩子成长记录、担心 App 哪天停用就丢了内容的家长。
 
-> ⚠️ 仅用于导出**你自己账号**的内容，用的是你在 App 里的登录状态。请勿用于他人账号。
+> ⚠️ 仅用于导出**你自己账号**能看到的内容，用的是你在 App 里的登录状态。请勿用于他人账号。
+> 老师代家长导出请先看 [七、隐私与安全](#七隐私与安全)。
 
 **不需要会编程**，跟着下面步骤复制粘贴即可。全程约 20–40 分钟（大头是下载相册的时间）。
 
@@ -13,30 +14,59 @@
 | 需要 | 说明 |
 |---|---|
 | 一台 **Mac 电脑** | macOS 系统。**目前仅支持 Mac**（Windows 暂不支持）。 |
-| **MuMu 模拟器** | 网易出品的免费安卓模拟器，用来在电脑上跑手机 App。 |
-| **鑫时光集家长版** App | 装在模拟器里，用你自己的账号登录。 |
+| **一个安卓环境** | 三选一，见步骤 1：**Android Studio 模拟器**（免费，推荐）、**MuMu 模拟器**（Mac 版需订阅）、**已 root 的安卓手机**。 |
+| **鑫时光集家长版** App | 装在上面那个安卓环境里，用你自己的账号登录。 |
 | **Python 3** | macOS 一般自带；下面教你确认。**不需要安装任何额外的库。** |
 | 硬盘空间 | 看相册大小，一般几百 MB 到几 GB。 |
+
+> **安卓环境只在最开始用一次**，就是让工具读一次 App 的登录信息。之后全程是你的 Mac 直接连服务器下载，模拟器可以关掉。
 
 ---
 
 ## 二、安装步骤
 
-### 步骤 1：安装 MuMu 模拟器（Mac 版）
+### 步骤 1：准备一个安卓环境（三选一）
 
-1. 浏览器搜索「**MuMu 模拟器 Mac**」，认准网易官方站点（`mumu.163.com`），下载 **Mac 版**。
-2. 打开下载的安装包，把 MuMu 拖进「应用程序」完成安装。
-3. 启动 MuMu，等它进入安卓桌面（第一次启动较慢，耐心等）。
+工具需要能读到 App 的登录信息，所以这个安卓环境必须有 **Root 权限**。下面三种任选一种。
 
-> 本工具依赖 MuMu 装在默认位置 `/Applications/MuMuPlayer.app`（正常安装即是）。
+#### 方案 A：Android Studio 自带模拟器（**免费，推荐**）
 
-### 步骤 2：在模拟器里装 App 并登录
+1. 打开 `https://developer.android.com/studio`，下载 **Android Studio**（免费）并安装。
+2. 启动后在欢迎界面点 **More Actions → Virtual Device Manager**（已打开项目的话是菜单 **Tools → Device Manager**），点 **+ / Create Virtual Device**。
+3. 机型随便挑一个（比如 Pixel 6），点 **Next**。
+4. **系统镜像这一步最关键**：
+   - 必须选名字里带 **Google APIs** 的镜像，**不要选带 Google Play 的**。
+   - Apple 芯片（M 系列）的 Mac 选 **arm64-v8a**，Intel 的 Mac 选 **x86_64**。
+   - 点镜像旁边的下载图标下好，再 **Next → Finish**。
 
-1. 在 MuMu 的安卓桌面里，打开自带的**应用市场**，搜索「**鑫时光集家长版**」安装；（或把它的安装包 `apk` 文件直接拖进 MuMu 安装。）
-2. 打开 App，用**你自己的账号登录**。
+   > 为什么不能选 Google Play 镜像：那种镜像出于安全禁用了 Root，工具读不到登录信息，会报 `prefs-read-failed`。
+
+5. 在设备列表点 **▶** 启动模拟器，等它进入安卓桌面。
+6. 把**鑫时光集家长版的 apk 安装包直接拖进模拟器窗口**即可安装。
+   - apk 从哪来？如果你手机上已经装了这个 App，可以在手机上打开「开发者选项 → USB 调试」，用数据线连上 Mac 后运行：
+     ```bash
+     ~/Library/Android/sdk/platform-tools/adb shell pm path com.childfolio.family
+     ```
+     它会打印一到多个 `package:/data/app/.../base.apk` 路径，再用 `adb pull <路径> ~/Desktop/` 把它们导到桌面。
+     只有一个文件就直接拖进模拟器；有多个（`split_config...`）就一起选中拖进去。
+
+#### 方案 B：MuMu 模拟器
+
+原来的方式，仍然完全支持。注意 **Mac 版目前是订阅制**（Windows 版免费）。
+
+1. 浏览器搜索「**MuMu 模拟器 Mac**」，认准网易官方站点（`mumu.163.com`）下载安装。
+2. 启动 MuMu，进 **设置 → 其他/系统 → 打开 Root 权限**，重启模拟器。
+3. 在 MuMu 自带的**应用市场**里搜索「鑫时光集家长版」安装，或把 apk 拖进去。
+
+#### 方案 C：已经 root 过的安卓手机
+
+手机上开启「开发者选项 → USB 调试」，用数据线连上 Mac 即可。工具会自动通过 `su` 读取登录信息。**没有 root 的手机不行**——系统不允许读 App 的私有数据。
+
+### 步骤 2：装 App 并登录
+
+1. 在上面选好的安卓环境里打开**鑫时光集家长版**。
+2. 用**你自己的账号登录**。
 3. 进入**照片 / 成长记录**页面浏览一下，确保内容能正常加载。之后保持 App 登录状态。
-
-> 如果稍后导出报「读不到登录信息」，多半是 MuMu 的 **Root 权限**没开：进 MuMu **设置 → 其他/系统 → 打开 Root 权限**，再重启一次模拟器。
 
 ### 步骤 3：确认 Python 3
 
@@ -69,7 +99,7 @@ cd xin-photo-exporter-android
 
 ## 三、开始导出
 
-先确认三件事：**MuMu 开着、鑫时光集已登录、你已在工具目录里**，然后运行：
+先确认三件事：**模拟器（或手机）连着、鑫时光集已登录、你已在工具目录里**，然后运行：
 
 ```bash
 python3 tools/export_originals.py api --yes
@@ -93,18 +123,56 @@ python3 tools/export_originals.py api --yes
 
 跑完就好了。**再次运行是安全的**——已下载的会自动跳过，只补新增的（比如你以后又发了新帖，重跑一次即可增量补齐）。
 
-> **模拟器可以提前关掉。** 工具只在最开始用模拟器读一次登录信息，之后全是你电脑直接连服务器下载。
-> 看到 `账号下共 N 个孩子档案，一起拉取。` 这行，就可以关掉 MuMu 了，省下的内存反而让下载更快。
+> **模拟器可以提前关掉。** 工具只在最开始读一次登录信息，之后全是你电脑直接连服务器下载。
+> 看到 `账号下共 N 个孩子档案，一起拉取。` 这行，就可以关掉模拟器了，省下的内存反而让下载更快。
 > （若中途失败要重跑，需要重新打开模拟器。）
 
 > **换账号登录后重跑，内容会合并在同一个 `build/` 里**（文件名只有日期和哈希，不区分账号）。
-> 想分开保存的话，先把上一个账号的 `build/` 改名或挪走，再跑新账号。
+> 想分开保存，用下面的 `--out` 指定不同目录。
+
+### 一个账号下有多个孩子：分开导出
+
+不加任何选项时，账号下**所有孩子的内容会混在一起**下载到 `build/`——文件名只有日期和哈希，事后分不出谁是谁。要分开保存，先列出档案 ID：
+
+```bash
+python3 tools/export_originals.py api --list-children
+```
+
+```
+账号下共 2 个孩子档案：
+  1. 11111111-2222-3333-4444-555555555555
+  2. 99999999-8888-7777-6666-555555555555
+用 --child-id <ID> 单独导出其中一个；档案 ID 属于个人信息，请勿外发。
+```
+
+然后一个孩子跑一次，各自指定输出目录（目录名自己起，比如孩子的名字）：
+
+```bash
+python3 tools/export_originals.py api --child-id 11111111-2222-3333-4444-555555555555 --out ~/Desktop/导出/小明 --yes
+```
+
+每个 `--out` 目录都是完整独立的一份（`originals/`、`videos/`、`captions.txt`、`moments.jsonl`），可以直接整个文件夹发给对应的家长。
+
+> 哪个 ID 对应哪个孩子？先随便挑一个跑，跑完打开 `captions.txt` 或 `originals/` 看一眼内容就知道了，然后把目录改成对应的名字。
+
+### 拿到 token 后可以完全不用模拟器
+
+登录信息（token）在过期前一直有效。如果你把它存进一个文件，之后重跑就**完全不需要开模拟器**：
+
+```bash
+python3 tools/export_originals.py api --token-file ~/xin-token.txt --child-id <孩子ID> --out ~/Desktop/导出/小明 --yes
+```
+
+也可以用环境变量 `XIN_ACCESS_TOKEN` 代替 `--token-file`。
+
+> **不要**把 token 直接打在命令行上——命令行会进终端历史记录，同一台电脑上的其他程序也看得到。用文件或环境变量。
+> token 文件等同于账号密码，别外发、别提交到 git；不用了就删掉。token 过期后重新开一次模拟器即可。
 
 ---
 
 ## 四、导出的东西在哪
 
-都在工具目录下的 `build/` 文件夹里：
+默认都在工具目录下的 `build/` 文件夹里（用了 `--out` 就在你指定的目录里）：
 
 | 位置 | 内容 |
 |---|---|
@@ -123,8 +191,20 @@ python3 tools/export_originals.py api --yes
 |---|---|
 | `--yes` | 不弹确认、直接下载（**推荐加上**）。不加则会先让你输入 `DOWNLOAD` 确认。 |
 | `--no-videos` | 只下照片、不下视频（正文照样保存）。网络差时可先只导照片，视频等网好再单独跑。 |
+| `--out <目录>` | 输出到指定目录（默认 `build/`）。**多个孩子分开导出时必用**。 |
+| `--list-children` | 只列出账号下的孩子档案 ID 后退出，不下载任何东西。 |
+| `--child-id <ID>` | 只导出指定的孩子，可重复写多个。不填则导出账号下全部。 |
+| `--token-file <文件>` | 从文件读登录 token，配合 `--child-id` 可完全不用模拟器。也可用环境变量 `XIN_ACCESS_TOKEN`。 |
 | `--counter <数字>` | 手动指定起始位置，兜底用，**一般不需要**（默认自动定位到最新）。 |
 | `--workers <数字>` | 同时下载几个文件，默认 `4`（上限 16）。网络好可调到 `8` 再快些；网络不稳或被限速就调到 `2`。 |
+
+连接安卓设备的选项，**一般不用填**（工具会自动找）：
+
+| 选项 | 作用 |
+|---|---|
+| `--adb <路径>` | 指定 adb 程序。默认按此顺序找：`ANDROID_SDK_ROOT`/`ANDROID_HOME` → Android Studio 默认 SDK 目录 → 系统 PATH → MuMu 自带的那个。 |
+| `--serial <序列号>` | 同时连了多台设备时指定用哪台。`adb devices` 可以查看。 |
+| `--package <包名>` | App 包名，默认 `com.childfolio.family`。 |
 
 只想先看看有多少、暂不下载：去掉 `--yes` 运行，看到候选数量后**直接按回车**即可取消，不会下载任何东西。
 
@@ -136,19 +216,25 @@ python3 tools/export_originals.py api --yes
 
 | 提示 | 原因 / 解决 |
 |---|---|
-| `mumu-not-running` | MuMu 没开、或安卓没启动完 → 打开 MuMu，等进入安卓桌面再运行。 |
-| `ambiguous-device` | 同时开了多个 MuMu 实例 → 只留一个。 |
-| `credentials-not-found` / `prefs-read-failed` | App 没装/没登录，或读不到登录态 → 在 MuMu 里打开鑫时光集、用自己账号登录、进一次相册页；仍失败就在 **MuMu 设置里开启 Root 权限**后重启模拟器。 |
+| `adb-not-found` | 找不到 adb 程序 → 装了 Android Studio 却仍报这个，就用 `--adb ~/Library/Android/sdk/platform-tools/adb` 明确指定。 |
+| `no-device` | 没有连上任何安卓设备 → 启动模拟器并等它进入桌面（或插上手机、确认已允许 USB 调试），再运行。用 `adb devices` 可以确认是否已连上。 |
+| `ambiguous-device` | 同时连了多台设备（比如模拟器 + 手机）→ 只留一台，或用 `--serial` 指定。 |
+| `mumu-not-running` | 用 MuMu 时它没开、或安卓没启动完 → 打开 MuMu，等进入安卓桌面再运行。 |
+| `prefs-read-failed` | 读不到 App 私有数据，基本都是**没有 Root 权限** → Android Studio 模拟器要用 **Google APIs** 镜像（不能是 Google Play 镜像）；MuMu 要在**设置里开启 Root 权限**并重启；真机必须已 root。 |
+| `credentials-not-found` | App 没装、没登录，或还没进过相册页 → 在模拟器里打开鑫时光集、用自己账号登录、进一次相册页再重试。 |
+| `invalid-child-id` | `--child-id` 写错了 → 必须是 `--list-children` 打印出来的那一长串带横线的 ID，整串复制。 |
+| `token-file-unreadable` / `token-file-empty` | `--token-file` 指的文件不存在或是空的 → 检查路径，或去掉这个选项改用模拟器。 |
 | `api-not-200` / `api-request-failed` | 网络问题或登录过期 → 检查网络；在 App 里**重新登录一次**换新登录态；再重试。 |
 | 卡住 / 下载很慢 | 多为网络原因，耐心等或换网络；随时按 `Ctrl-C` 停止，已下的会保留，之后重跑续下。也可以试试调小 `--workers`（如 `--workers 2`），有些网络对并发敏感。 |
 | 结尾出现 `失败 N` | 下面会跟一行 `失败原因：xxx × N`。`download-failed` / `http-not-200` 多是网络问题，**重跑一次通常就好**；其他原因重跑无用，请提 issue。 |
-| 设备掉线 / `device offline` | 重启一次 MuMu 再运行。 |
+| 设备掉线 / `device offline` | 重启一次模拟器再运行。 |
 
 ---
 
 ## 七、隐私与安全
 
 - **只导出你自己账号**的内容，用的就是你在 App 里的登录状态，不碰别人的账号。
+- **老师 / 园所代为导出时**：导出范围仅限你的账号本来就能看到的内容；请按孩子分目录（`--child-id` + `--out`），**只把每个孩子的目录发给他自己的家长**，发完及时清理本机副本。孩子的照片属于个人信息，转交前请确认家长知情同意，并遵守园所的相关规定。
 - 登录凭证（token）只在你电脑内存里用来调用**你自己账号**的接口，**绝不打印、不保存、不上传**。
 - 导出的照片 / 视频 / 文字**只存在你电脑本地** `build/` 目录，工具不向任何服务器上传内容。
 - `build/` 已在 `.gitignore` 中，即使你用 git，也不会把私人内容传到网上。
@@ -162,6 +248,7 @@ python3 tools/export_originals.py api --yes
 ## 八、给开发者（可选）
 
 - **无第三方依赖**，纯 Python 标准库，无需 `pip install`。
-- 运行测试：`python3 -m unittest tests.test_export_originals tests.test_feed_api`
+- 运行测试：`python3 -m unittest tests.test_export_originals tests.test_feed_api tests.test_device`
 - 接口若失效需重新分析，见 [`docs/mitm-capture-runbook.md`](docs/mitm-capture-runbook.md)。
+- 设备层（`tools/device.py`）与模拟器品牌无关：定位 adb → 选设备 → 读 prefs，读取时依次尝试直接 `cat`、`adb root` 后重试、`su -c`，因此 Google APIs 模拟器镜像、MuMu 和已 root 真机走同一条代码路径。
 - 工作原理：从 App 的 `shared_prefs` 读取登录态，翻页调用后端 `moment/FamilyMoment/v2/getPageMomentList` 接口（`counter` 游标 + `hasMore` 分页），抽取每条帖子的正文、照片（`pictureURLs`）、视频（`videoUrl`），交给本地下载器。只拉 JSON、不渲染图片，低内存、可导全库。

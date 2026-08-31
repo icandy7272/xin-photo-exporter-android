@@ -68,6 +68,9 @@ class SmokeError(RuntimeError):
 @dataclass(frozen=True)
 class Device:
     serial: str
+    # Which adb speaks to this device. Defaults to MuMu's bundled binary so
+    # existing callers keep working; `device.find_adb` supplies the SDK one.
+    adb: Path = ADB
 
 
 @dataclass(frozen=True)
@@ -241,7 +244,14 @@ def _info_rows(payload: object) -> list[dict]:
     return []
 
 
-def discover_running_device(run_command: Callable = run_command) -> Device:
+def discover_running_device(
+    run_command: Callable = run_command, adb: Path = ADB
+) -> Device:
+    """Find the single running MuMu instance and connect adb to it.
+
+    MuMu-specific; `tools.device.discover_device` is the generic entry point
+    and falls back to this when no device is attached.
+    """
     result = run_command([MUMUTOOL, "info", "all"])
     if result.returncode != 0:
         raise SmokeError("mumu-not-running")
@@ -266,10 +276,10 @@ def discover_running_device(run_command: Callable = run_command) -> Device:
     if not isinstance(port, int) or not 1 <= port <= 65535:
         raise SmokeError("mumu-not-running")
     serial = f"127.0.0.1:{port}"
-    connected = run_command([ADB, "connect", serial])
+    connected = run_command([adb, "connect", serial])
     if connected.returncode != 0:
         raise SmokeError("mumu-not-running")
-    return Device(serial=serial)
+    return Device(serial=serial, adb=adb)
 
 
 def apply_record_date(
@@ -541,21 +551,95 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="跳过 DOWNLOAD 交互确认，直接下载（用于非交互 / 自动化）",
     )
+    api_parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        metavar="目录",
+        help="输出目录（默认 build/）。给不同孩子分别指定，导出的内容才不会混在一起",
+    )
+    device_group = api_parser.add_argument_group(
+        "安卓设备",
+        "只用于读一次登录态。MuMu、Android Studio 模拟器（Google APIs 镜像）"
+        "和已 root 的真机都可以；给了 token 就完全用不到设备。",
+    )
+    device_group.add_argument(
+        "--adb",
+        default=None,
+        metavar="路径",
+        help="adb 可执行文件路径（默认自动查找 Android SDK、PATH，最后回退 MuMu 自带的）",
+    )
+    device_group.add_argument(
+        "--serial",
+        default=None,
+        help="指定 adb 设备序列号（同时连了多台时用；`adb devices` 可查）",
+    )
+    device_group.add_argument(
+        "--package",
+        default=PACKAGE,
+        help=f"App 包名（默认 {PACKAGE}）",
+    )
+    device_group.add_argument(
+        "--list-children",
+        action="store_true",
+        help="只列出账号下的孩子档案 ID 后退出，供 --child-id 使用",
+    )
+    api_parser.add_argument(
+        "--child-id",
+        action="append",
+        default=None,
+        metavar="ID",
+        help="只导出指定孩子（可重复；不填则导出账号下全部）",
+    )
+    api_parser.add_argument(
+        "--token-file",
+        type=Path,
+        default=None,
+        metavar="文件",
+        help=(
+            "存有登录 token 的文件；也可用环境变量 XIN_ACCESS_TOKEN。"
+            "配合 --child-id 使用可完全不需要模拟器（token 过期前有效）"
+        ),
+    )
     return parser
 
 
-def _run_api(
-    counter: int | None, include_videos: bool, assume_yes: bool, workers: int
-) -> int:
+def _modules():
+    """Import the sibling modules late, so the CLI works either way it is run."""
     try:
-        from tools.feed_api import run_api
-    except ImportError:
-        from feed_api import run_api
-    return run_api(
-        initial_counter=counter,
-        include_videos=include_videos,
-        assume_yes=assume_yes,
-        workers=workers,
+        from tools import credentials, feed_api
+    except ImportError:  # pragma: no cover - `python3 tools/export_originals.py`
+        import credentials
+        import feed_api
+    return credentials, feed_api
+
+
+def _run_api(args: argparse.Namespace) -> int:
+    credentials, feed_api = _modules()
+    try:
+        if args.list_children:
+            return feed_api.run_list_children(
+                adb_path=args.adb, serial=args.serial, package=args.package
+            )
+        # Resolved before any network or device work so a typo fails at once.
+        token = credentials.load_token(args.token_file)
+        child_ids = credentials.normalise_child_ids(args.child_id)
+    except credentials.eo.SmokeError as exc:
+        # Run as a script this file is imported twice (as ``__main__`` and as
+        # ``export_originals``), so catch the class the modules actually raise.
+        print(f"失败：{exc}")
+        return 1
+    return feed_api.run_api(
+        initial_counter=args.counter,
+        include_videos=not args.no_videos,
+        assume_yes=args.yes,
+        workers=args.workers,
+        build_root=args.out or feed_api.BUILD_ROOT,
+        adb_path=args.adb,
+        serial=args.serial,
+        package=args.package,
+        token=token,
+        child_ids=child_ids,
     )
 
 
@@ -563,12 +647,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "api":
-        return _run_api(
-            args.counter,
-            include_videos=not args.no_videos,
-            assume_yes=args.yes,
-            workers=args.workers,
-        )
+        try:
+            return _run_api(args)
+        except SmokeError as exc:
+            print(f"失败：{exc}")
+            return 1
     parser.print_help()
     return 1
 

@@ -1,6 +1,7 @@
 import contextlib
 import io
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -504,12 +505,32 @@ class CliTests(unittest.TestCase):
     def test_api_dispatches(self):
         with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
             self.assertEqual(eo.main(["api", "--yes"]), 0)
-        run_api.assert_called_once_with(
-            initial_counter=None,
-            include_videos=True,
-            assume_yes=True,
-            workers=eo.DEFAULT_WORKERS,
+        # The full flag-to-kwarg mapping is asserted in test_feed_api's
+        # CliDispatchTests; here only the subcommand wiring matters.
+        kwargs = run_api.call_args.kwargs
+        self.assertTrue(kwargs["assume_yes"])
+        self.assertEqual(kwargs["workers"], eo.DEFAULT_WORKERS)
+
+    def _script(self, *args):
+        """Run the file as a script: that import path duplicates this module."""
+        return subprocess.run(
+            [sys.executable, str(eo.REPOSITORY_ROOT / "tools" / "export_originals.py"), *args],
+            capture_output=True,
+            text=True,
+            check=False,
         )
+
+    def test_script_mode_reports_bad_child_id_without_a_traceback(self):
+        result = self._script("api", "--child-id", "nope")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("失败：invalid-child-id", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_script_mode_reports_unreadable_token_file(self):
+        result = self._script("api", "--token-file", "/nope/token.txt")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("失败：token-file-unreadable", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_no_command_prints_help_and_returns_one(self):
         with contextlib.redirect_stdout(io.StringIO()):

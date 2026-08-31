@@ -40,8 +40,10 @@ from typing import Callable
 
 try:  # package import (tests / `python3 -m ...`)
     from tools import export_originals as eo
+    from tools import credentials as creds
 except ImportError:  # pragma: no cover - `python3 tools/export_originals.py`
     import export_originals as eo
+    import credentials as creds
 
 
 API_BASE = "https://api-gateway.childfolio.net"
@@ -57,14 +59,6 @@ API_USER_AGENT = "okhttp/3.14.9"
 COUNTER_SEED = 2_360_360
 COUNTER_CEILING = 2_000_000_000
 DEFAULT_MAX_PAGES = 5000
-_PREF_STRING_RE = r'<string name="{key}">([^<]*)</string>'
-_UUID_RE = re.compile(
-    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
-)
-# album_child_id is only set once the album is opened, and holds just the open
-# album. childIds/paChildIds are JSON arrays holding *every* child of the
-# account, so all three keys are read and unioned (see extract_child_ids).
-_CHILD_ID_KEYS = ("album_child_id", "childIds", "paChildIds")
 
 VIDEO_EXTS = (".mp4", ".mov", ".m4v")
 VIDEO_MIN_BYTES = 1024
@@ -97,53 +91,39 @@ class VideoSummary:
     failed: int
 
 
-def extract_pref_string(prefs_xml: str, key: str) -> str | None:
-    """Return the value of a ``<string name="key">`` entry, or None."""
-    match = re.search(_PREF_STRING_RE.format(key=re.escape(key)), prefs_xml)
-    if match is None:
-        return None
-    return match.group(1) or None
+@dataclass(frozen=True)
+class OutputPaths:
+    """Where one export writes. All four hang off a single root directory."""
+
+    root: Path
+    photos: Path
+    videos: Path
+    manifest: Path
+    captions: Path
 
 
-def extract_child_ids(prefs_xml: str) -> tuple[str, ...]:
-    """Find every child UUID in album_child_id / childIds / paChildIds.
+def output_paths(root: Path = BUILD_ROOT) -> OutputPaths:
+    """Derive every output location from one root.
 
-    An account can hold more than one child record - a sibling, or the same
-    child re-enrolled under a new record. The app merges their timelines, so
-    the exporter must ask for all of them: requesting only the first ends the
-    feed at that record's oldest post and silently loses the earlier years.
+    A separate root per run is how one operator keeps several children's
+    exports apart: filenames are date+hash only, so two children sharing a
+    root would interleave into one indistinguishable pile.
     """
-    found: list[str] = []
-    for key in _CHILD_ID_KEYS:
-        value = extract_pref_string(prefs_xml, key)
-        if not value:
-            continue
-        for child_id in _UUID_RE.findall(value):
-            if child_id not in found:
-                found.append(child_id)
-    return tuple(found)
-
-
-def read_app_credentials(
-    device: "eo.Device", run_command: Callable = eo.run_command
-) -> tuple[str, tuple[str, ...]]:
-    """Read the Bearer token and every child id from the app's prefs."""
-    result = run_command(
-        [
-            eo.ADB,
-            "-s",
-            device.serial,
-            "shell",
-            f"cat /data/data/{eo.PACKAGE}/shared_prefs/*.xml",
-        ]
+    return OutputPaths(
+        root=root,
+        photos=root / "originals",
+        videos=root / "videos",
+        manifest=root / "moments.jsonl",
+        captions=root / "captions.txt",
     )
-    if result.returncode != 0:
-        raise eo.SmokeError("prefs-read-failed")
-    token = extract_pref_string(result.stdout, "accessToken")
-    child_ids = extract_child_ids(result.stdout)
-    if not token or not child_ids:
-        raise eo.SmokeError("credentials-not-found")
-    return token, child_ids
+
+
+def _is_inside_repository(path: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(eo.REPOSITORY_ROOT)
+    except ValueError:
+        return False
+    return True
 
 
 def validate_video_url(raw: str) -> str | None:
@@ -534,6 +514,37 @@ def write_captions(records: list[MomentRecord], path: Path = CAPTIONS_PATH) -> i
     return written
 
 
+def run_list_children(
+    *,
+    adb_path: str | Path | None = None,
+    serial: str | None = None,
+    package: str = eo.PACKAGE,
+    run_command: Callable = eo.run_command,
+    printer: Callable[[str], None] = print,
+) -> int:
+    """Print the child ids the logged-in account can see, for --child-id."""
+    try:
+        child_ids = creds.extract_child_ids(
+            creds.prefs_reader(
+                adb_path=adb_path,
+                serial=serial,
+                package=package,
+                run_command=run_command,
+            )()
+        )
+    except eo.SmokeError as exc:
+        printer(f"失败：{exc}")
+        return 1
+    if not child_ids:
+        printer("失败：credentials-not-found")
+        return 1
+    printer(f"账号下共 {len(child_ids)} 个孩子档案：")
+    for index, child_id in enumerate(child_ids, 1):
+        printer(f"  {index}. {child_id}")
+    printer("用 --child-id <ID> 单独导出其中一个；档案 ID 属于个人信息，请勿外发。")
+    return 0
+
+
 def run_api(
     *,
     run_command: Callable = eo.run_command,
@@ -541,19 +552,40 @@ def run_api(
     input_fn: Callable = input,
     downloader: Callable | None = None,
     video_downloader: Callable | None = None,
-    output_dir: Path = PHOTO_OUTPUT,
-    video_output_dir: Path = VIDEO_OUTPUT,
+    build_root: Path = BUILD_ROOT,
+    output_dir: Path | None = None,
+    video_output_dir: Path | None = None,
     include_videos: bool = True,
     assume_yes: bool = False,
     initial_counter: int | None = None,
     workers: int = eo.DEFAULT_WORKERS,
+    adb_path: str | Path | None = None,
+    serial: str | None = None,
+    package: str = eo.PACKAGE,
+    token: str | None = None,
+    child_ids: tuple[str, ...] = (),
 ) -> int:
     """Collect the whole feed, save post text, then confirm and download."""
+    paths = output_paths(build_root)
+    output_dir = output_dir or paths.photos
+    video_output_dir = video_output_dir or paths.videos
     try:
-        device = eo.discover_running_device(run_command)
-        token, child_ids = read_app_credentials(device, run_command)
+        requested_ids = tuple(child_ids)
+        token, child_ids = creds.resolve_credentials(
+            token=token,
+            child_ids=requested_ids,
+            read_prefs=creds.prefs_reader(
+                adb_path=adb_path,
+                serial=serial,
+                package=package,
+                run_command=run_command,
+            ),
+        )
         opener = opener or eo.build_opener()
-        print(f"账号下共 {len(child_ids)} 个孩子档案，一起拉取。")
+        if requested_ids:
+            print(f"只拉取指定的 {len(child_ids)} 个孩子档案。")
+        else:
+            print(f"账号下共 {len(child_ids)} 个孩子档案，一起拉取。")
 
         def post_page(cids: tuple[str, ...], counter: int) -> object:
             return fetch_moment_page(opener, token, cids, counter)
@@ -580,11 +612,14 @@ def run_api(
         if not records:
             print("没有帖子，不写文件。")
             return 0
-        eo.ensure_build_is_ignored()
-        write_manifest(records)
-        captions = write_captions(records)
-        print(f"帖子清单：{MANIFEST_PATH}（{len(records)} 条）")
-        print(f"正文文本：{CAPTIONS_PATH}（{captions} 条有正文）")
+        # The .gitignore rule only protects the repository's own build dir; an
+        # export written elsewhere is the operator's to place safely.
+        if _is_inside_repository(paths.root):
+            eo.ensure_build_is_ignored()
+        write_manifest(records, paths.manifest)
+        captions = write_captions(records, paths.captions)
+        print(f"帖子清单：{paths.manifest}（{len(records)} 条）")
+        print(f"正文文本：{paths.captions}（{captions} 条有正文）")
         if not photo_urls and video_total == 0:
             print("没有可下载的媒体（正文已保存）。")
             return 0

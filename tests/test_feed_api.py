@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import subprocess
@@ -42,17 +43,12 @@ def _completed(stdout: str, returncode: int = 0):
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
 
 
-class ExtractPrefStringTests(unittest.TestCase):
-    def test_found(self):
-        xml = '<map><string name="accessToken">tok123</string></map>'
-        self.assertEqual(feed_api.extract_pref_string(xml, "accessToken"), "tok123")
-
-    def test_missing_returns_none(self):
-        self.assertIsNone(feed_api.extract_pref_string("<map/>", "accessToken"))
-
-    def test_empty_value_returns_none(self):
-        xml = '<string name="album_child_id"></string>'
-        self.assertIsNone(feed_api.extract_pref_string(xml, "album_child_id"))
+@contextlib.contextmanager
+def _stub_device():
+    """Pretend adb resolved to a device, so tests never touch the host's SDK."""
+    with mock.patch.object(feed_api.creds.android, "find_adb", return_value=Path("adb")), \
+            mock.patch.object(feed_api.creds.android, "discover_device", return_value=eo.Device("s")):
+        yield
 
 
 class ValidateVideoUrlTests(unittest.TestCase):
@@ -205,72 +201,6 @@ class CollectApiUrlsTests(unittest.TestCase):
 
 _UUID = "00000000-0000-4000-8000-000000000000"
 _UUID2 = "00000000-0000-4000-8000-000000000001"
-
-
-class ExtractChildIdsTests(unittest.TestCase):
-    def test_returns_every_child_in_the_account(self):
-        # A parent account can hold more than one child record (a sibling, or
-        # the same child re-enrolled). Missing one truncates the feed.
-        xml = f'<string name="childIds">["{_UUID}","{_UUID2}"]</string>'
-        self.assertEqual(feed_api.extract_child_ids(xml), (_UUID, _UUID2))
-
-    def test_unions_keys_without_dropping_ids(self):
-        # album_child_id holds only the open album; childIds holds them all.
-        xml = (
-            f'<string name="album_child_id">{_UUID2}</string>'
-            f'<string name="childIds">["{_UUID}","{_UUID2}"]</string>'
-            f'<string name="paChildIds">["{_UUID}","{_UUID2}"]</string>'
-        )
-        self.assertEqual(set(feed_api.extract_child_ids(xml)), {_UUID, _UUID2})
-        self.assertEqual(len(feed_api.extract_child_ids(xml)), 2)
-
-    def test_no_children_returns_empty(self):
-        self.assertEqual(feed_api.extract_child_ids("<map/>"), ())
-
-
-class ReadCredentialsTests(unittest.TestCase):
-    def test_reads_token_and_album_child_id(self):
-        xml = (
-            f'<string name="accessToken">tok</string>'
-            f'<string name="album_child_id">{_UUID}</string>'
-        )
-        token, children = feed_api.read_app_credentials(
-            eo.Device("127.0.0.1:1"), run_command=lambda argv: _completed(xml)
-        )
-        self.assertEqual((token, children), ("tok", (_UUID,)))
-
-    def test_falls_back_to_child_ids_after_login(self):
-        # album_child_id empty right after login; childIds holds the id.
-        xml = (
-            f'<string name="accessToken">tok</string>'
-            f'<string name="album_child_id"></string>'
-            f'<string name="childIds">["{_UUID}"]</string>'
-        )
-        token, children = feed_api.read_app_credentials(
-            eo.Device("s"), run_command=lambda argv: _completed(xml)
-        )
-        self.assertEqual((token, children), ("tok", (_UUID,)))
-
-    def test_reads_every_child_not_just_the_first(self):
-        xml = (
-            f'<string name="accessToken">tok</string>'
-            f'<string name="childIds">["{_UUID}","{_UUID2}"]</string>'
-        )
-        _, children = feed_api.read_app_credentials(
-            eo.Device("s"), run_command=lambda argv: _completed(xml)
-        )
-        self.assertEqual(children, (_UUID, _UUID2))
-
-    def test_missing_child_id_raises(self):
-        xml = '<string name="accessToken">tok</string>'
-        with self.assertRaises(eo.SmokeError):
-            feed_api.read_app_credentials(eo.Device("s"), run_command=lambda argv: _completed(xml))
-
-    def test_command_failure_raises(self):
-        with self.assertRaises(eo.SmokeError):
-            feed_api.read_app_credentials(
-                eo.Device("s"), run_command=lambda argv: _completed("", returncode=1)
-            )
 
 
 class _Resp:
@@ -496,7 +426,7 @@ class RunApiTests(unittest.TestCase):
 
     def _run(self, page, *, input_answer="DOWNLOAD", include_videos=True, assume_yes=False, downloader=None, video_patch=None):
         downloader = downloader or (lambda urls, out, **kw: eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0))
-        with mock.patch.object(eo, "discover_running_device", return_value=eo.Device("s")), \
+        with _stub_device(), \
                 mock.patch.object(feed_api, "fetch_moment_page", return_value=page), \
                 mock.patch.object(eo, "ensure_build_is_ignored"), \
                 mock.patch.object(feed_api, "write_manifest", return_value=1) as wm, \
@@ -574,7 +504,7 @@ class RunApiTests(unittest.TestCase):
 
     def test_requests_every_child_of_the_account(self):
         page = _payload([_moment(momentId="m1", pictureURLs=[_pic("2024-01-02", "a")])])
-        with mock.patch.object(eo, "discover_running_device", return_value=eo.Device("s")), \
+        with _stub_device(), \
                 mock.patch.object(feed_api, "fetch_moment_page", return_value=page) as fetch, \
                 mock.patch.object(eo, "ensure_build_is_ignored"), \
                 mock.patch.object(feed_api, "write_manifest", return_value=1), \
@@ -601,7 +531,7 @@ class RunApiTests(unittest.TestCase):
         wm.assert_not_called()
 
     def test_credentials_failure_returns_one(self):
-        with mock.patch.object(eo, "discover_running_device", return_value=eo.Device("s")):
+        with _stub_device():
             with redirect_stdout(io.StringIO()):
                 rc = feed_api.run_api(
                     run_command=lambda argv: _completed("", returncode=1),
@@ -646,7 +576,7 @@ class FindStartCounterTests(unittest.TestCase):
             got["urls"] = urls
             return eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0)
 
-        with mock.patch.object(eo, "discover_running_device", return_value=eo.Device("s")), \
+        with _stub_device(), \
                 mock.patch.object(feed_api, "fetch_moment_page", side_effect=fake_fetch), \
                 mock.patch.object(eo, "ensure_build_is_ignored"), \
                 mock.patch.object(feed_api, "write_manifest", return_value=1), \
@@ -668,41 +598,241 @@ class FindStartCounterTests(unittest.TestCase):
 
 
 class CliDispatchTests(unittest.TestCase):
-    def test_api_dispatches_with_counter_and_videos(self):
+    """Every flag reaches run_api; defaults keep the old behaviour."""
+
+    def _dispatch(self, argv):
         with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
-            rc = eo.main(["api", "--counter", "12345"])
+            rc = eo.main(["api"] + argv)
+        return rc, run_api.call_args.kwargs
+
+    def test_defaults(self):
+        rc, kwargs = self._dispatch([])
         self.assertEqual(rc, 0)
-        run_api.assert_called_once_with(
-            initial_counter=12345,
-            include_videos=True,
-            assume_yes=False,
-            workers=eo.DEFAULT_WORKERS,
+        self.assertEqual(
+            kwargs,
+            {
+                "initial_counter": None,
+                "include_videos": True,
+                "assume_yes": False,
+                "workers": eo.DEFAULT_WORKERS,
+                "build_root": feed_api.BUILD_ROOT,
+                "adb_path": None,
+                "serial": None,
+                "package": eo.PACKAGE,
+                "token": None,
+                "child_ids": (),
+            },
         )
 
-    def test_api_no_videos_flag(self):
-        with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
-            eo.main(["api", "--no-videos"])
-        run_api.assert_called_once_with(
-            initial_counter=None,
-            include_videos=False,
-            assume_yes=False,
-            workers=eo.DEFAULT_WORKERS,
-        )
+    def test_counter_and_workers(self):
+        _, kwargs = self._dispatch(["--counter", "12345", "--workers", "8"])
+        self.assertEqual(kwargs["initial_counter"], 12345)
+        self.assertEqual(kwargs["workers"], 8)
 
-    def test_api_yes_flag(self):
-        with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
-            eo.main(["api", "--yes"])
-        run_api.assert_called_once_with(
-            initial_counter=None,
-            include_videos=True,
-            assume_yes=True,
-            workers=eo.DEFAULT_WORKERS,
-        )
+    def test_no_videos_and_yes_flags(self):
+        _, kwargs = self._dispatch(["--no-videos", "--yes"])
+        self.assertFalse(kwargs["include_videos"])
+        self.assertTrue(kwargs["assume_yes"])
 
-    def test_api_workers_flag(self):
-        with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
-            eo.main(["api", "--workers", "8"])
-        self.assertEqual(run_api.call_args.kwargs["workers"], 8)
+    def test_device_flags(self):
+        _, kwargs = self._dispatch(
+            ["--adb", "/sdk/adb", "--serial", "emulator-5554", "--package", "com.example.app"]
+        )
+        self.assertEqual(kwargs["adb_path"], "/sdk/adb")
+        self.assertEqual(kwargs["serial"], "emulator-5554")
+        self.assertEqual(kwargs["package"], "com.example.app")
+
+    def test_out_directory_becomes_the_build_root(self):
+        _, kwargs = self._dispatch(["--out", "/exports/child-a"])
+        self.assertEqual(kwargs["build_root"], Path("/exports/child-a"))
+
+    def test_child_id_flag_repeats_and_validates(self):
+        other = "99999999-8888-7777-6666-555555555555"
+        _, kwargs = self._dispatch(["--child-id", _UUID, "--child-id", other])
+        self.assertEqual(kwargs["child_ids"], (_UUID, other))
+
+    def test_bad_child_id_is_rejected_before_any_work(self):
+        with mock.patch("tools.feed_api.run_api") as run_api:
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                rc = eo.main(["api", "--child-id", "nope"])
+        self.assertEqual(rc, 1)
+        self.assertIn("invalid-child-id", buffer.getvalue())
+        run_api.assert_not_called()
+
+    def test_token_file_is_read_and_passed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "token.txt"
+            path.write_text("tok-file", encoding="utf-8")
+            _, kwargs = self._dispatch(["--token-file", str(path)])
+        self.assertEqual(kwargs["token"], "tok-file")
+
+    def test_unreadable_token_file_reports_and_stops(self):
+        with mock.patch("tools.feed_api.run_api") as run_api:
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                rc = eo.main(["api", "--token-file", "/nope/token.txt"])
+        self.assertEqual(rc, 1)
+        self.assertIn("token-file-unreadable", buffer.getvalue())
+        run_api.assert_not_called()
+
+    def test_list_children_short_circuits_the_export(self):
+        with mock.patch("tools.feed_api.run_list_children", return_value=0) as listing, \
+                mock.patch("tools.feed_api.run_api") as run_api:
+            rc = eo.main(["api", "--list-children", "--serial", "emulator-5554"])
+        self.assertEqual(rc, 0)
+        run_api.assert_not_called()
+        self.assertEqual(listing.call_args.kwargs["serial"], "emulator-5554")
+
+
+class OutputPathsTests(unittest.TestCase):
+    def test_every_output_hangs_off_the_root(self):
+        paths = feed_api.output_paths(Path("/exports/child-a"))
+        self.assertEqual(paths.photos, Path("/exports/child-a/originals"))
+        self.assertEqual(paths.videos, Path("/exports/child-a/videos"))
+        self.assertEqual(paths.manifest, Path("/exports/child-a/moments.jsonl"))
+        self.assertEqual(paths.captions, Path("/exports/child-a/captions.txt"))
+
+    def test_default_root_is_the_repository_build_dir(self):
+        self.assertEqual(feed_api.output_paths().root, feed_api.BUILD_ROOT)
+
+
+class OutsideRepositoryTests(unittest.TestCase):
+    def test_repository_build_dir_is_inside(self):
+        self.assertTrue(feed_api._is_inside_repository(feed_api.BUILD_ROOT))
+
+    def test_other_directory_is_outside(self):
+        self.assertFalse(feed_api._is_inside_repository(Path("/tmp/exports")))
+
+
+class RunApiCredentialSourceTests(unittest.TestCase):
+    """The device is one credential source among several, not a hard step."""
+
+    def _page(self):
+        return _payload([_moment(momentId="m1", momentCaption="hi", pictureURLs=[_pic("2024-01-02", "a")])])
+
+    def _run(self, **kwargs):
+        with mock.patch.object(feed_api, "fetch_moment_page", return_value=self._page()), \
+                mock.patch.object(eo, "ensure_build_is_ignored"), \
+                mock.patch.object(feed_api, "write_manifest", return_value=1), \
+                mock.patch.object(feed_api, "write_captions", return_value=1), \
+                mock.patch.object(feed_api, "download_videos", return_value=feed_api.VideoSummary(0, 0, 0, 0)):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                rc = feed_api.run_api(
+                    opener=object(),
+                    downloader=lambda urls, out, **kw: eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0),
+                    assume_yes=True,
+                    initial_counter=feed_api.COUNTER_SEED,
+                    **kwargs,
+                )
+        return rc, buffer.getvalue()
+
+    def test_supplied_token_and_child_id_never_touch_adb(self):
+        def run_command(argv):
+            raise AssertionError("no device call expected")
+
+        rc, _ = self._run(run_command=run_command, token="tok-manual", child_ids=(_UUID,))
+        self.assertEqual(rc, 0)
+
+    def test_supplied_child_ids_are_the_ones_requested(self):
+        seen = {}
+
+        def fetch(opener, token, child_ids, counter, timeout=30):
+            seen["token"] = token
+            seen["child_ids"] = child_ids
+            return _payload([])
+
+        with mock.patch.object(feed_api, "fetch_moment_page", side_effect=fetch), \
+                redirect_stdout(io.StringIO()):
+            feed_api.run_api(
+                opener=object(),
+                run_command=lambda argv: self.fail("no device call expected"),
+                token="tok-manual",
+                child_ids=(_UUID,),
+                assume_yes=True,
+                initial_counter=feed_api.COUNTER_SEED,
+            )
+        self.assertEqual(seen, {"token": "tok-manual", "child_ids": (_UUID,)})
+
+    def test_missing_token_falls_back_to_the_device(self):
+        prefs = _completed(
+            f'<string name="accessToken">tok-device</string><string name="album_child_id">{_UUID}</string>'
+        )
+        with mock.patch.object(feed_api.creds.android, "find_adb", return_value=Path("adb")), \
+                mock.patch.object(feed_api.creds.android, "discover_device", return_value=eo.Device("s")):
+            rc, out = self._run(run_command=lambda argv: prefs, child_ids=(_UUID,))
+        self.assertEqual(rc, 0)
+        self.assertNotIn("tok-device", out)  # the token is never printed
+
+    def test_device_failure_returns_one(self):
+        with mock.patch.object(feed_api.creds.android, "find_adb", side_effect=eo.SmokeError("adb-not-found")):
+            rc, out = self._run(run_command=lambda argv: _completed(""))
+        self.assertEqual(rc, 1)
+        self.assertIn("adb-not-found", out)
+
+
+class RunApiOutputRootTests(unittest.TestCase):
+    def test_every_artifact_lands_under_the_chosen_root(self):
+        page = _payload([_moment(momentId="m1", momentCaption="hi", pictureURLs=[_pic("2024-01-02", "a")])])
+        seen = {}
+
+        def downloader(urls, out, **kw):
+            seen["photos"] = out
+            return eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "小明"
+            with mock.patch.object(feed_api, "fetch_moment_page", return_value=page), \
+                    mock.patch.object(eo, "ensure_build_is_ignored") as ignored, \
+                    mock.patch.object(feed_api, "download_videos", return_value=feed_api.VideoSummary(0, 0, 0, 0)), \
+                    redirect_stdout(io.StringIO()):
+                rc = feed_api.run_api(
+                    opener=object(),
+                    run_command=lambda argv: self.fail("no device call expected"),
+                    token="tok",
+                    child_ids=(_UUID,),
+                    build_root=root,
+                    downloader=downloader,
+                    assume_yes=True,
+                    initial_counter=feed_api.COUNTER_SEED,
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual(seen["photos"], root / "originals")
+            self.assertTrue((root / "moments.jsonl").is_file())
+            self.assertTrue((root / "captions.txt").is_file())
+            # A root outside the repository is not covered by its .gitignore.
+            ignored.assert_not_called()
+
+
+class RunListChildrenTests(unittest.TestCase):
+    def _prefs(self, xml):
+        return lambda argv: _completed(xml)
+
+    def test_prints_every_child_id(self):
+        other = "99999999-8888-7777-6666-555555555555"
+        xml = (
+            '<string name="accessToken">tok</string>'
+            f'<string name="childIds">["{_UUID}","{other}"]</string>'
+        )
+        lines: list[str] = []
+        with mock.patch.object(feed_api.creds.android, "find_adb", return_value=Path("adb")), \
+                mock.patch.object(feed_api.creds.android, "discover_device", return_value=eo.Device("s")):
+            rc = feed_api.run_list_children(
+                run_command=self._prefs(xml), printer=lines.append
+            )
+        self.assertEqual(rc, 0)
+        text = "\n".join(lines)
+        self.assertIn(_UUID, text)
+        self.assertIn(other, text)
+        self.assertNotIn("tok", text)  # the token is never printed
+
+    def test_device_failure_returns_one(self):
+        lines: list[str] = []
+        with mock.patch.object(feed_api.creds.android, "find_adb", side_effect=eo.SmokeError("adb-not-found")):
+            rc = feed_api.run_list_children(run_command=lambda argv: _completed(""), printer=lines.append)
+        self.assertEqual(rc, 1)
+        self.assertIn("adb-not-found", "\n".join(lines))
 
 
 if __name__ == "__main__":
