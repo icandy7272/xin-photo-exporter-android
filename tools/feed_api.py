@@ -26,6 +26,7 @@ filenames only, never URLs.
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import os
@@ -403,6 +404,29 @@ def download_video(opener, url: str, destination: Path, timeout: int = 600) -> i
         raise eo.SmokeError("download-failed") from None
 
 
+def _video_outcome(
+    url: str,
+    output_dir: Path,
+    *,
+    opener,
+    downloader: Callable,
+    date_setter: Callable,
+) -> str:
+    """Fetch one video; return "existing" / "downloaded" / "failed"."""
+    destination = video_destination(url, output_dir)
+    if destination.exists() and destination.stat().st_size > VIDEO_MIN_BYTES:
+        return "existing"
+    try:
+        downloader(opener, url, destination)
+    except eo.SmokeError:
+        return "failed"
+    try:
+        date_setter(destination, _url_date(url))
+    except Exception:
+        pass
+    return "downloaded"
+
+
 def download_videos(
     records: list[MomentRecord],
     output_dir: Path = VIDEO_OUTPUT,
@@ -410,8 +434,9 @@ def download_videos(
     opener=None,
     date_setter: Callable = eo.apply_record_date,
     video_downloader: Callable | None = None,
+    workers: int = eo.DEFAULT_WORKERS,
 ) -> VideoSummary:
-    """Download every unique video from the collected posts."""
+    """Download every unique video from the collected posts, concurrently."""
     urls: list[str] = []
     seen: set[str] = set()
     for record in records:
@@ -421,32 +446,35 @@ def download_videos(
     if not urls:
         return VideoSummary(0, 0, 0, 0)
     downloader = video_downloader or download_video
-    opener = opener or eo.build_opener()
-    downloaded = existing = failed = 0
+    get_opener = eo._thread_opener(opener)
     previous_umask = os.umask(0o077)
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
-        for index, url in enumerate(urls):
-            destination = video_destination(url, output_dir)
-            if destination.exists() and destination.stat().st_size > VIDEO_MIN_BYTES:
-                existing += 1
-                continue
-            print(f"视频 {index + 1}/{len(urls)}")
-            try:
-                downloader(opener, url, destination)
-            except eo.SmokeError:
-                failed += 1
-                continue
-            except KeyboardInterrupt:
-                break
-            downloaded += 1
-            try:
-                date_setter(destination, _url_date(url))
-            except Exception:
-                pass
+
+        def task(url: str) -> str:
+            return _video_outcome(
+                url,
+                output_dir,
+                opener=get_opener(),
+                downloader=downloader,
+                date_setter=date_setter,
+            )
+
+        outcomes, _ = eo.run_concurrently(
+            urls,
+            task,
+            workers=workers,
+            progress=lambda done, total: print(f"视频 {done}/{total}"),
+        )
     finally:
         os.umask(previous_umask)
-    return VideoSummary(len(urls), downloaded, existing, failed)
+    counted = collections.Counter(outcomes.values())
+    return VideoSummary(
+        len(urls),
+        counted.get("downloaded", 0),
+        counted.get("existing", 0),
+        counted.get("failed", 0),
+    )
 
 
 def _photo_filenames(record: MomentRecord) -> list[str]:
@@ -518,6 +546,7 @@ def run_api(
     include_videos: bool = True,
     assume_yes: bool = False,
     initial_counter: int | None = None,
+    workers: int = eo.DEFAULT_WORKERS,
 ) -> int:
     """Collect the whole feed, save post text, then confirm and download."""
     try:
@@ -564,7 +593,9 @@ def run_api(
         elif not eo.confirm_download(len(photo_urls), input_fn):
             print("已取消媒体下载；正文已保存。")
             return 0
-        photo_result = (downloader or eo.download_batch)(photo_urls, output_dir)
+        photo_result = (downloader or eo.download_batch)(
+            photo_urls, output_dir, workers=workers
+        )
         video_summary = VideoSummary(0, 0, 0, 0)
         if include_videos and video_total:
             video_summary = download_videos(
@@ -572,6 +603,7 @@ def run_api(
                 video_output_dir,
                 opener=opener,
                 video_downloader=video_downloader,
+                workers=workers,
             )
             print(
                 "视频结果："

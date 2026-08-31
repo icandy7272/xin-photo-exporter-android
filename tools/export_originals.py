@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 import collections
+import concurrent.futures
 import hashlib
 import json
 import os
 import ssl
 import subprocess
+import threading
 import time
 import re
 from dataclasses import dataclass
@@ -40,6 +42,10 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MIN_BYTES = 1024
 MAX_BYTES = 50 * 1024 * 1024
 CHUNK_BYTES = 64 * 1024
+# A single serial stream never fills the link; a few parallel ones do. Kept
+# modest on purpose - the CDN throttles aggressive clients.
+DEFAULT_WORKERS = 4
+MAX_WORKERS = 16
 # Content photos are jpeg/jpg or png (all seen on the CDN, no query);
 # the extension may be upper- or lower-case, so compare lower-cased.
 IMAGE_EXTS = (".jpeg", ".jpg", ".png")
@@ -109,6 +115,70 @@ def build_opener():
         urllib.request.HTTPSHandler(context=context),
         RejectRedirects(),
     )
+
+
+def clamp_workers(workers: int) -> int:
+    """Keep concurrency inside a range the CDN tolerates."""
+    return max(1, min(int(workers), MAX_WORKERS))
+
+
+def _thread_opener(opener) -> Callable:
+    """Return a callable handing each worker thread its own opener.
+
+    urllib openers carry per-request state, so threads must not share one. An
+    explicitly injected opener is passed through unchanged for tests.
+    """
+    if opener is not None:
+        return lambda: opener
+    local = threading.local()
+
+    def get_opener():
+        if getattr(local, "opener", None) is None:
+            local.opener = build_opener()
+        return local.opener
+
+    return get_opener
+
+
+def run_concurrently(
+    items: list,
+    task: Callable,
+    *,
+    workers: int,
+    progress: Callable[[int, int], None],
+) -> tuple[dict, bool]:
+    """Run ``task`` over ``items`` in a thread pool, keyed by item.
+
+    Returns ``(results_by_item, interrupted)``. On Ctrl-C the queued work is
+    cancelled and whatever already finished is returned, so a long run can be
+    stopped without throwing away its progress.
+    """
+    results: dict = {}
+    if not items:
+        return results, False
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=clamp_workers(workers))
+    futures = {pool.submit(task, item): item for item in items}
+    interrupted = False
+    try:
+        for future in concurrent.futures.as_completed(futures):
+            results[futures[future]] = future.result()
+            progress(len(results), len(items))
+    except KeyboardInterrupt:
+        interrupted = True
+    # Cancel what has not started, but wait for what is mid-flight: the pool's
+    # threads never see the interrupt, and abandoning them races with whatever
+    # they are still writing. The interpreter joins them at exit regardless, so
+    # waiting costs no extra time - it only makes the outcome predictable.
+    pool.shutdown(wait=True, cancel_futures=interrupted)
+    if interrupted:
+        for future, item in futures.items():
+            if item in results or future.cancelled() or not future.done():
+                continue
+            try:  # salvage work that finished while we were unwinding
+                results[item] = future.result()
+            except BaseException:
+                pass
+    return results, interrupted
 
 
 def run_command(argv: list[str | Path]) -> subprocess.CompletedProcess[str]:
@@ -323,11 +393,17 @@ def download_batch(
     sleep_fn: Callable = time.sleep,
     date_setter: Callable = apply_record_date,
     candidate_downloader: Callable | None = None,
+    workers: int = DEFAULT_WORKERS,
 ) -> BatchSummary:
+    """Download every unique URL, retrying failures over three passes.
+
+    Each pass runs concurrently; the pass structure is kept so a transient
+    failure still gets two more chances before it is counted as failed.
+    """
     ensure_build_is_ignored()
     candidates = list(dict.fromkeys(urls))
     candidate_downloader = candidate_downloader or download_batch_candidate
-    opener = opener or build_opener()
+    get_opener = _thread_opener(opener)
     previous_umask = os.umask(0o077)
     downloaded = 0
     existing = 0
@@ -342,29 +418,24 @@ def download_batch(
                 break
             if pass_index > 0:
                 sleep_fn(2)
+
+            def task(url: str) -> CandidateOutcome:
+                return candidate_downloader(
+                    url, output_dir, opener=get_opener(), date_setter=date_setter
+                )
+
+            label = f"第 {pass_index + 1} 轮"
+            outcomes, interrupted = run_concurrently(
+                pending,
+                task,
+                workers=workers,
+                progress=lambda done, total: print(f"{label}：{done}/{total}"),
+            )
             next_pending: list[str] = []
-            for index, url in enumerate(pending):
-                print(f"第 {pass_index + 1} 轮：{index + 1}/{len(pending)}")
-                try:
-                    outcome = candidate_downloader(
-                        url,
-                        output_dir,
-                        opener=opener,
-                        date_setter=date_setter,
-                    )
-                except KeyboardInterrupt:
-                    unprocessed = len(next_pending) + len(pending) - index
-                    summary = BatchSummary(
-                        len(candidates),
-                        downloaded,
-                        existing,
-                        failed,
-                        date_failed,
-                        unprocessed,
-                        tuple(reasons.most_common()),
-                    )
-                    _print_batch_summary(summary, output_dir)
-                    return summary
+            for url in pending:
+                outcome = outcomes.get(url)
+                if outcome is None:  # cancelled before it ran
+                    continue
                 if outcome.status == "downloaded":
                     downloaded += 1
                     date_failed += int(outcome.date_failed)
@@ -376,6 +447,18 @@ def download_batch(
                     reasons[outcome.reason or "unknown"] += 1
                 else:
                     next_pending.append(url)
+            if interrupted:
+                summary = BatchSummary(
+                    len(candidates),
+                    downloaded,
+                    existing,
+                    failed,
+                    date_failed,
+                    len(pending) - len(outcomes) + len(next_pending),
+                    tuple(reasons.most_common()),
+                )
+                _print_batch_summary(summary, output_dir)
+                return summary
             pending = next_pending
         summary = BatchSummary(
             len(candidates),
@@ -448,6 +531,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="只下照片，不下载视频（正文仍会保存）",
     )
     api_parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"并发下载数（默认 {DEFAULT_WORKERS}，上限 {MAX_WORKERS}；网络差可调小）",
+    )
+    api_parser.add_argument(
         "--yes",
         action="store_true",
         help="跳过 DOWNLOAD 交互确认，直接下载（用于非交互 / 自动化）",
@@ -455,7 +544,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_api(counter: int | None, include_videos: bool, assume_yes: bool) -> int:
+def _run_api(
+    counter: int | None, include_videos: bool, assume_yes: bool, workers: int
+) -> int:
     try:
         from tools.feed_api import run_api
     except ImportError:
@@ -464,6 +555,7 @@ def _run_api(counter: int | None, include_videos: bool, assume_yes: bool) -> int
         initial_counter=counter,
         include_videos=include_videos,
         assume_yes=assume_yes,
+        workers=workers,
     )
 
 
@@ -472,7 +564,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "api":
         return _run_api(
-            args.counter, include_videos=not args.no_videos, assume_yes=args.yes
+            args.counter,
+            include_videos=not args.no_videos,
+            assume_yes=args.yes,
+            workers=args.workers,
         )
     parser.print_help()
     return 1

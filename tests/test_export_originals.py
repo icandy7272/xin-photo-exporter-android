@@ -2,6 +2,8 @@ import contextlib
 import io
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from datetime import date
 from pathlib import Path
@@ -364,6 +366,114 @@ class FailureReasonTests(unittest.TestCase):
         self.assertEqual(summary.failure_reasons, ())
 
 
+class ConcurrencyTests(unittest.TestCase):
+    def _run(self, downloader, urls, workers):
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.object(eo, "ensure_build_is_ignored"):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    return eo.download_batch(
+                        urls,
+                        Path(temp),
+                        opener=object(),
+                        sleep_fn=lambda s: None,
+                        candidate_downloader=downloader,
+                        workers=workers,
+                    )
+
+    def test_candidates_run_in_parallel(self):
+        lock = threading.Lock()
+        active = peak = 0
+
+        def downloader(url, output_dir, *, opener, date_setter):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return eo.CandidateOutcome("downloaded")
+
+        summary = self._run(downloader, [f"u{i}" for i in range(8)], workers=4)
+        self.assertEqual(summary.downloaded, 8)
+        self.assertGreater(peak, 1)  # actually concurrent, not just faster
+
+    def test_interrupt_returns_what_finished(self):
+        # workers=1 plus interrupting on the last item makes the cut exact:
+        # nothing is left queued for the pool to race us on.
+        def downloader(url, output_dir, *, opener, date_setter):
+            if url == "u5":
+                raise KeyboardInterrupt
+            return eo.CandidateOutcome("downloaded")
+
+        summary = self._run(downloader, [f"u{i}" for i in range(6)], workers=1)
+        self.assertEqual(summary.downloaded, 5)  # u0..u4 kept
+        self.assertEqual(summary.unprocessed, 1)  # only u5 lost
+        self.assertEqual(summary.total, 6)
+
+    def test_every_url_is_attempted_exactly_once_per_pass(self):
+        seen = []
+        lock = threading.Lock()
+
+        def downloader(url, output_dir, *, opener, date_setter):
+            with lock:
+                seen.append(url)
+            return eo.CandidateOutcome("downloaded")
+
+        urls = [f"u{i}" for i in range(20)]
+        self._run(downloader, urls, workers=6)
+        self.assertEqual(sorted(seen), sorted(urls))
+
+    def test_retry_semantics_survive_concurrency(self):
+        attempts = []
+        lock = threading.Lock()
+
+        def downloader(url, output_dir, *, opener, date_setter):
+            with lock:
+                attempts.append(url)
+            return eo.CandidateOutcome(
+                "downloaded" if url == "good" else "failed", reason="http-not-200"
+            )
+
+        summary = self._run(downloader, ["good", "bad"], workers=4)
+        self.assertEqual(summary.downloaded, 1)
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(attempts.count("bad"), 3)  # still 3 passes
+        self.assertEqual(summary.failure_reasons, (("http-not-200", 1),))
+
+
+class ClampWorkersTests(unittest.TestCase):
+    def test_keeps_concurrency_in_range(self):
+        self.assertEqual(eo.clamp_workers(4), 4)
+        self.assertEqual(eo.clamp_workers(0), 1)
+        self.assertEqual(eo.clamp_workers(-3), 1)
+        self.assertEqual(eo.clamp_workers(999), eo.MAX_WORKERS)
+
+
+class ThreadOpenerTests(unittest.TestCase):
+    def test_injected_opener_is_shared(self):
+        sentinel = object()
+        get = eo._thread_opener(sentinel)
+        self.assertIs(get(), sentinel)
+
+    def test_each_thread_builds_its_own(self):
+        # urllib openers keep per-connection state, so threads must not share.
+        get = eo._thread_opener(None)
+        seen = []
+        with mock.patch.object(eo, "build_opener", side_effect=lambda: object()):
+            def grab():
+                seen.append(get())
+                seen.append(get())  # same thread reuses
+
+            threads = [threading.Thread(target=grab) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(len(seen), 6)
+        self.assertEqual(len({id(o) for o in seen}), 3)  # one per thread
+
+
 class ConfirmDownloadTests(unittest.TestCase):
     def test_only_exact_download_confirms(self):
         self.assertTrue(eo.confirm_download(3, input_fn=lambda p: "DOWNLOAD"))
@@ -394,7 +504,12 @@ class CliTests(unittest.TestCase):
     def test_api_dispatches(self):
         with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
             self.assertEqual(eo.main(["api", "--yes"]), 0)
-        run_api.assert_called_once_with(initial_counter=None, include_videos=True, assume_yes=True)
+        run_api.assert_called_once_with(
+            initial_counter=None,
+            include_videos=True,
+            assume_yes=True,
+            workers=eo.DEFAULT_WORKERS,
+        )
 
     def test_no_command_prints_help_and_returns_one(self):
         with contextlib.redirect_stdout(io.StringIO()):

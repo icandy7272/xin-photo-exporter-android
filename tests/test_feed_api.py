@@ -2,6 +2,8 @@ import io
 import json
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -398,6 +400,52 @@ class DownloadVideosTests(unittest.TestCase):
             self.assertEqual(summary.downloaded, 1)
             self.assertEqual(calls, [v2])
 
+    def test_videos_download_in_parallel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = threading.Lock()
+            active = peak = 0
+
+            def fake_downloader(opener, url, dest):
+                nonlocal active, peak
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                time.sleep(0.05)
+                with lock:
+                    active -= 1
+                dest.write_bytes(b"y" * 4096)
+
+            urls = [_vid("2024-01-%02d" % (i + 1), f"v{i}") for i in range(8)]
+            with redirect_stdout(io.StringIO()):
+                summary = feed_api.download_videos(
+                    self._records(*urls),
+                    Path(tmp),
+                    opener=object(),
+                    video_downloader=fake_downloader,
+                    workers=4,
+                )
+            self.assertEqual(summary.downloaded, 8)
+            self.assertGreater(peak, 1)
+
+    def test_interrupt_keeps_finished_videos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def fake_downloader(opener, url, dest):
+                if url.endswith("v5.mp4"):
+                    raise KeyboardInterrupt
+                dest.write_bytes(b"y" * 4096)
+
+            urls = [_vid("2024-01-%02d" % (i + 1), f"v{i}") for i in range(6)]
+            with redirect_stdout(io.StringIO()):
+                summary = feed_api.download_videos(
+                    self._records(*urls),
+                    Path(tmp),
+                    opener=object(),
+                    video_downloader=fake_downloader,
+                    workers=1,
+                )
+            self.assertEqual(summary.downloaded, 5)  # v0..v4 kept
+            self.assertEqual(summary.total, 6)
+
     def test_no_videos_returns_empty(self):
         summary = feed_api.download_videos(self._records(None, None), Path("/x"))
         self.assertEqual(summary, feed_api.VideoSummary(0, 0, 0, 0))
@@ -447,7 +495,7 @@ class RunApiTests(unittest.TestCase):
         )
 
     def _run(self, page, *, input_answer="DOWNLOAD", include_videos=True, assume_yes=False, downloader=None, video_patch=None):
-        downloader = downloader or (lambda urls, out: eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0))
+        downloader = downloader or (lambda urls, out, **kw: eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0))
         with mock.patch.object(eo, "discover_running_device", return_value=eo.Device("s")), \
                 mock.patch.object(feed_api, "fetch_moment_page", return_value=page), \
                 mock.patch.object(eo, "ensure_build_is_ignored"), \
@@ -470,7 +518,7 @@ class RunApiTests(unittest.TestCase):
         page = _payload([_moment(momentId="m1", momentCaption="hi", pictureURLs=[_pic("2024-01-02", "a")])])
         got = {}
 
-        def downloader(urls, out):
+        def downloader(urls, out, **kw):
             got["urls"] = urls
             return eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0)
 
@@ -501,7 +549,7 @@ class RunApiTests(unittest.TestCase):
         page = _payload([_moment(momentId="m1", momentCaption="hi", pictureURLs=[_pic("2024-01-02", "a")])])
         called = {"n": 0}
 
-        def downloader(urls, out):
+        def downloader(urls, out, **kw):
             called["n"] += 1
             return eo.BatchSummary(0, 0, 0, 0, 0, 0)
 
@@ -515,7 +563,7 @@ class RunApiTests(unittest.TestCase):
         page = _payload([_moment(momentId="m1", pictureURLs=[_pic("2024-01-02", "a")])])
         called = {"n": 0}
 
-        def downloader(urls, out):
+        def downloader(urls, out, **kw):
             called["n"] += 1
             return eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0)
 
@@ -542,7 +590,7 @@ class RunApiTests(unittest.TestCase):
                     run_command=lambda argv: _completed(xml),
                     opener=object(),
                     assume_yes=True,
-                    downloader=lambda urls, out: eo.BatchSummary(1, 1, 0, 0, 0, 0),
+                    downloader=lambda urls, out, **kw: eo.BatchSummary(1, 1, 0, 0, 0, 0),
                     initial_counter=feed_api.COUNTER_SEED,
                 )
         self.assertEqual(fetch.call_args.args[2], (_UUID, _UUID2))
@@ -594,7 +642,7 @@ class FindStartCounterTests(unittest.TestCase):
 
         got = {}
 
-        def fake_downloader(urls, out):
+        def fake_downloader(urls, out, **kw):
             got["urls"] = urls
             return eo.BatchSummary(len(urls), len(urls), 0, 0, 0, 0)
 
@@ -625,22 +673,36 @@ class CliDispatchTests(unittest.TestCase):
             rc = eo.main(["api", "--counter", "12345"])
         self.assertEqual(rc, 0)
         run_api.assert_called_once_with(
-            initial_counter=12345, include_videos=True, assume_yes=False
+            initial_counter=12345,
+            include_videos=True,
+            assume_yes=False,
+            workers=eo.DEFAULT_WORKERS,
         )
 
     def test_api_no_videos_flag(self):
         with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
             eo.main(["api", "--no-videos"])
         run_api.assert_called_once_with(
-            initial_counter=None, include_videos=False, assume_yes=False
+            initial_counter=None,
+            include_videos=False,
+            assume_yes=False,
+            workers=eo.DEFAULT_WORKERS,
         )
 
     def test_api_yes_flag(self):
         with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
             eo.main(["api", "--yes"])
         run_api.assert_called_once_with(
-            initial_counter=None, include_videos=True, assume_yes=True
+            initial_counter=None,
+            include_videos=True,
+            assume_yes=True,
+            workers=eo.DEFAULT_WORKERS,
         )
+
+    def test_api_workers_flag(self):
+        with mock.patch("tools.feed_api.run_api", return_value=0) as run_api:
+            eo.main(["api", "--workers", "8"])
+        self.assertEqual(run_api.call_args.kwargs["workers"], 8)
 
 
 if __name__ == "__main__":
