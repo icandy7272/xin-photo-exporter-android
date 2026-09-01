@@ -676,6 +676,15 @@ class CliDispatchTests(unittest.TestCase):
         self.assertIn("token-file-unreadable", buffer.getvalue())
         run_api.assert_not_called()
 
+    def test_save_token_short_circuits_the_export(self):
+        with mock.patch("tools.feed_api.run_save_token", return_value=0) as saving, \
+                mock.patch("tools.feed_api.run_api") as run_api:
+            rc = eo.main(["api", "--save-token", "/tmp/t.txt", "--serial", "emulator-5554"])
+        self.assertEqual(rc, 0)
+        run_api.assert_not_called()
+        self.assertEqual(saving.call_args.kwargs["token_file"], Path("/tmp/t.txt"))
+        self.assertEqual(saving.call_args.kwargs["serial"], "emulator-5554")
+
     def test_list_children_short_circuits_the_export(self):
         with mock.patch("tools.feed_api.run_list_children", return_value=0) as listing, \
                 mock.patch("tools.feed_api.run_api") as run_api:
@@ -833,6 +842,88 @@ class RunListChildrenTests(unittest.TestCase):
             rc = feed_api.run_list_children(run_command=lambda argv: _completed(""), printer=lines.append)
         self.assertEqual(rc, 1)
         self.assertIn("adb-not-found", "\n".join(lines))
+
+
+class RunSaveTokenTests(unittest.TestCase):
+    def _prefs(self, xml):
+        return lambda argv: _completed(xml)
+
+    def _xml(self):
+        return (
+            "<map>"
+            '<string name="accessToken">tok-secret-value</string>'
+            f'<string name="album_child_id">{_UUID}</string>'
+            "</map>"
+        )
+
+    def test_saves_the_token_without_ever_printing_it(self):
+        lines: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "xin-token.txt"
+            with _stub_device():
+                rc = feed_api.run_save_token(
+                    token_file=path,
+                    run_command=self._prefs(self._xml()),
+                    printer=lines.append,
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual(path.read_text(encoding="utf-8"), "tok-secret-value")
+        self.assertNotIn("tok-secret-value", "\n".join(lines))
+
+    def test_reports_where_it_went_and_warns(self):
+        lines: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "xin-token.txt"
+            with _stub_device():
+                feed_api.run_save_token(
+                    token_file=path,
+                    run_command=self._prefs(self._xml()),
+                    printer=lines.append,
+                )
+            self.assertIn(str(path), "\n".join(lines))
+
+    def test_device_failure_returns_one(self):
+        lines: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "xin-token.txt"
+            with mock.patch.object(
+                feed_api.creds.android, "find_adb", side_effect=eo.SmokeError("no-device")
+            ):
+                rc = feed_api.run_save_token(
+                    token_file=path,
+                    run_command=self._prefs(""),
+                    printer=lines.append,
+                )
+            self.assertEqual(rc, 1)
+            self.assertFalse(path.exists())
+        self.assertIn("no-device", "\n".join(lines))
+
+    def test_bad_destination_is_caught_before_any_device_work(self):
+        """A path typo must not cost the user a whole emulator round-trip."""
+        lines: list[str] = []
+
+        def no_device_calls(argv):
+            raise AssertionError("the device must not be touched")
+
+        rc = feed_api.run_save_token(
+            token_file=eo.REPOSITORY_ROOT / "token.txt",
+            run_command=no_device_calls,
+            printer=lines.append,
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("token-file-in-repository", "\n".join(lines))
+
+    def test_refuses_a_path_inside_the_repository(self):
+        lines: list[str] = []
+        with _stub_device():
+            rc = feed_api.run_save_token(
+                token_file=eo.REPOSITORY_ROOT / "token.txt",
+                run_command=self._prefs(self._xml()),
+                printer=lines.append,
+            )
+        self.assertEqual(rc, 1)
+        self.assertIn("token-file-in-repository", "\n".join(lines))
+        self.assertFalse((eo.REPOSITORY_ROOT / "token.txt").exists())
 
 
 if __name__ == "__main__":

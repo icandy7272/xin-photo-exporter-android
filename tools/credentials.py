@@ -123,6 +123,41 @@ def load_token(
     return None
 
 
+def check_token_destination(token_file: Path) -> None:
+    """Validate where a token would go, before any device work happens.
+
+    Reading the login state means booting an emulator and waiting; finding
+    out only afterwards that the path was wrong wastes all of it.
+    """
+    _refuse_token_inside_repository(Path(token_file))
+
+
+def save_token_file(token: str, token_file: Path) -> Path:
+    """Write the token to disk, owner-readable only.
+
+    The one place the token is deliberately persisted. Saving it during a
+    trial-period emulator session is what lets later incremental runs skip
+    the emulator entirely - so it needs to be easy to do *safely* rather
+    than left to people pasting the token through their terminal, where it
+    lands in scrollback and shell history.
+    """
+    token_file = Path(token_file)
+    _refuse_token_inside_repository(token_file)
+    previous_umask = os.umask(0o077)
+    try:
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        # Truncate rather than append: a longer stale token must not survive
+        # underneath a shorter new one.
+        with token_file.open("w", encoding="utf-8") as handle:
+            handle.write(token)
+        token_file.chmod(0o600)
+    except OSError:
+        raise eo.SmokeError("token-file-unwritable") from None
+    finally:
+        os.umask(previous_umask)
+    return token_file
+
+
 def normalise_child_ids(raw: Sequence[str] | None) -> tuple[str, ...]:
     """Validate and de-duplicate child ids supplied on the command line."""
     if not raw:
