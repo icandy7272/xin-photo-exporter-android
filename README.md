@@ -59,19 +59,22 @@ cd xin-photo-exporter-android
 
 #### 路线 A：MuMu 模拟器（推荐先试）
 
-MuMu 的 Mac 版目前提供 **7 天免费试用**（之后转订阅，以官网为准）。
-导出照片是**一次性的活**，7 天绰绰有余，而且 MuMu 全程图形界面，比敲命令省心。
+按官网说明，MuMu 为**未试用过的 Mac 设备**提供 **7 天免费试用**，需登录 MuMu 账号后开启，
+到期后需付费（条款以 `mumu.163.com` 为准）。导出照片是**一次性的活**，7 天绰绰有余，
+而且 MuMu 全程图形界面、自带应用市场，比敲命令省心。
 
-1. 浏览器搜索「**MuMu 模拟器 Mac**」，认准网易官方站点（`mumu.163.com`）下载安装。
-2. 启动 MuMu，进 **设置 → 其他/系统 → 打开 Root 权限**，然后**重启一次模拟器**。
+1. 浏览器打开网易官方站点 `mumu.163.com`，下载 **macOS 版**并安装。
+2. 启动 MuMu，**注册/登录 MuMu 账号并开启 7 天试用**。
+3. 进 **设置 → 其他/系统 → 打开 Root 权限**，然后**重启一次模拟器**。
    （这步不做的话，后面会报 `prefs-read-failed`。）
-3. 直接跳到步骤 4。
+4. 跳到步骤 4 装 App。
 
-> 试用到期后还想再导（比如以后又发了新帖想增量补齐），用下面的路线 B，不用再花钱。
+> ⚠️ **试用是按设备算的，一台 Mac 只有一次。** 如果这台 Mac 以前装过 MuMu、
+> 试用期已经用掉或已过期，就没有 7 天可用了——直接走下面的路线 B。
 
 #### 路线 B：免费的安卓官方模拟器（兜底）
 
-MuMu 试用到期、或者你不想装 MuMu，用这条。一条命令搞定：
+**这台 Mac 的 MuMu 试用已用掉或已过期、或者你不想装 MuMu**，就用这条。一条命令搞定：
 
 ```bash
 python3 tools/setup_emulator.py
@@ -171,38 +174,6 @@ python3 tools/export_originals.py api --child-id 11111111-2222-3333-4444-5555555
 
 > 哪个 ID 对应哪个孩子？先随便挑一个跑，跑完打开 `captions.txt` 或 `originals/` 看一眼内容就知道了，然后把目录改成对应的名字。
 
-### 存下登录信息，以后不用再开模拟器
-
-**如果你走的是 MuMu 的 7 天试用，这一步值得在到期前做掉。**
-
-登录信息（token）在过期前一直有效。趁模拟器还开着、还登录着，把它存下来：
-
-```bash
-python3 tools/export_originals.py api --save-token ~/xin-token.txt
-```
-
-之后再导出就**完全不需要开模拟器**了，加上 `--token-file` 指向这个文件即可：
-
-```bash
-python3 tools/export_originals.py api --token-file ~/xin-token.txt --yes
-```
-
-配合分孩子导出也一样：
-
-```bash
-python3 tools/export_originals.py api --token-file ~/xin-token.txt --child-id <孩子ID> --out ~/Desktop/导出/小明 --yes
-```
-
-也可以用环境变量 `XIN_ACCESS_TOKEN` 代替 `--token-file`。
-
-> ⚠️ **这个文件等同于账号密码**——拿到它就能读你账号下的全部内容，不需要密码也不需要验证码。
-> - 存在**工具目录外面**（像上面那样放 `~/`）。放进工具目录里工具会直接拒绝，因为一旦 `git add` 就会永久泄露。
-> - 别外发、别提交到 git、别放网盘。不用了就删掉：`rm ~/xin-token.txt`
-> - **不要**把 token 直接打在命令行参数里——命令行会进终端历史记录。用 `--save-token` 生成文件最安全，全程不显示内容。
-> - 万一泄露：**在 App 里退出登录再重新登录**，旧 token 立即作废。只删文件没用。
-
-> token 过期后（时长由服务器决定，我们没实测过）重新开一次模拟器、再跑一次 `--save-token` 即可。
-
 ### 用完之后：清除模拟器里的登录信息
 
 导出完就把登录状态清掉，别让它留在模拟器里。
@@ -245,8 +216,7 @@ python3 tools/export_originals.py api --token-file ~/xin-token.txt --child-id <�
 | `--out <目录>` | 输出到指定目录（默认 `build/`）。**多个孩子分开导出时必用**。 |
 | `--list-children` | 只列出账号下的孩子档案 ID 后退出，不下载任何东西。 |
 | `--child-id <ID>` | 只导出指定的孩子，可重复写多个。不填则导出账号下全部。 |
-| `--save-token <文件>` | 把当前登录信息存到文件后退出。**MuMu 试用到期前做掉这一步**，以后就不用再开模拟器。 |
-| `--token-file <文件>` | 从上面存的文件读登录信息，完全不用模拟器。也可用环境变量 `XIN_ACCESS_TOKEN`。 |
+| `--token-file <文件>` | 高级用法，一般用不到，见「给开发者」一节。 |
 | `--counter <数字>` | 手动指定起始位置，兜底用，**一般不需要**（默认自动定位到最新）。 |
 | `--workers <数字>` | 同时下载几个文件，默认 `4`（上限 16）。网络好可调到 `8` 再快些；网络不稳或被限速就调到 `2`。 |
 
@@ -290,11 +260,9 @@ python3 tools/export_originals.py api --token-file ~/xin-token.txt --child-id <�
 
 - **只导出你自己账号**的内容，用的就是你在 App 里的登录状态，不碰别人的账号。
 - **老师 / 园所代为导出时**：导出范围仅限你的账号本来就能看到的内容；请按孩子分目录（`--child-id` + `--out`），**只把每个孩子的目录发给他自己的家长**，发完及时清理本机副本。孩子的照片属于个人信息，转交前请确认家长知情同意，并遵守园所的相关规定。
-- 登录凭证（token）只在你电脑内存里用来调用**你自己账号**的接口，**绝不打印、不保存、不上传**。
-- **token 等同于账号密码，甚至更危险**：拿到它就能以你的身份读取全部内容，**不需要密码、不需要短信验证码**。一个账号一个 token，覆盖该账号下的所有孩子。
-  - **绝对不要提交到 GitHub。** Git 会永久记住——事后删文件没用，历史里还在，别人克隆走的那份也追不回来。工具会拒绝读取放在本仓库目录里的 token 文件（报 `token-file-in-repository`）。
-  - 不要写在命令行参数里（会进终端历史），用 `--token-file` 或环境变量 `XIN_ACCESS_TOKEN`。
-  - 万一泄露了：**立刻在 App 里退出登录再重新登录**，旧 token 随即作废。只删文件是没用的。
+- 登录凭证（token）**只在内存里存在**：工具从模拟器读出来后直接用于调用你自己账号的接口，**绝不打印、不写盘、不上传**。跑完就没了，磁盘上不会留下任何凭证文件。
+  - 这是刻意的设计。token 等同于账号密码而且更危险——拿到它就能以你的身份读取全部内容，**不需要密码、不需要短信验证码**（一个账号一个 token，覆盖该账号下所有孩子）。导出是毕业后的一次性动作，没有理由把这种东西留在硬盘上。
+  - 万一它以别的方式泄露了（截图、日志、误传）：**立刻在 App 里退出登录再重新登录**，旧 token 随即作废。删文件没用。
 - 导出的照片 / 视频 / 文字**只存在你电脑本地** `build/` 目录，工具不向任何服务器上传内容。
 - `build/` 已在 `.gitignore` 中，即使你用 git，也不会把私人内容传到网上。
 - 不要把 `build/`、完整媒体 URL、请求日志、模拟器数据目录、截图或包含 `childId`/园所标识的配置文件上传到 GitHub、Issue、网盘或聊天工具。
@@ -309,6 +277,7 @@ python3 tools/export_originals.py api --token-file ~/xin-token.txt --child-id <�
 - **无第三方依赖**，纯 Python 标准库，无需 `pip install`。
 - 运行测试：`python3 -m unittest discover -s tests -t .`（190 项，全部离线，不碰真实设备或网络）
 - 接口若失效需重新分析，见 [`docs/mitm-capture-runbook.md`](docs/mitm-capture-runbook.md)。
+- `--token-file <文件>` / 环境变量 `XIN_ACCESS_TOKEN`：直接提供登录 token，跳过设备读取，用于接口重新分析等场景。工具**不提供**导出 token 的命令——毕业后不再产生新照片，导出是一次性的，没有必要把一份等同账号密码的凭证落到磁盘上。真要用，`load_token` 会拒绝读取仓库目录内的文件（`token-file-in-repository`），避免误提交。
 - 模块划分：`device.py` 找 adb / 选设备 / 读 prefs；`credentials.py` 把设备与命令行参数汇成 token+childIds；`feed_api.py` 翻页与下载；`setup_emulator.py` 一键装模拟器。
 - 设备层与模拟器品牌无关：读 prefs 时依次尝试直接 `cat`、`adb root` 后重试、`su -c`，因此 Google APIs 镜像、MuMu 和已 root 真机走同一条代码路径。
 - 两类失败必须分清：**读不到** `/data/data`（Root/镜像问题）报 `prefs-read-failed`；**读到了但没有登录态**报 `credentials-not-found`。判据是 prefs XML 的根元素 `<map>`——不能用 `<string>`，App 装了没登录时 prefs 里可能一个字符串都没有。

@@ -591,13 +591,6 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ID",
         help="只导出指定孩子（可重复；不填则导出账号下全部）",
     )
-    device_group.add_argument(
-        "--save-token",
-        type=Path,
-        default=None,
-        metavar="文件",
-        help="把当前登录信息存到文件后退出，供以后 --token-file 使用（不要放在本工具目录里）",
-    )
     api_parser.add_argument(
         "--token-file",
         type=Path,
@@ -624,13 +617,6 @@ def _modules():
 def _run_api(args: argparse.Namespace) -> int:
     credentials, feed_api = _modules()
     try:
-        if args.save_token:
-            return feed_api.run_save_token(
-                token_file=args.save_token,
-                adb_path=args.adb,
-                serial=args.serial,
-                package=args.package,
-            )
         if args.list_children:
             return feed_api.run_list_children(
                 adb_path=args.adb, serial=args.serial, package=args.package

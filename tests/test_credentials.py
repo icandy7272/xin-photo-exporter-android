@@ -238,46 +238,5 @@ class TokenFileInRepositoryTests(unittest.TestCase):
             path.unlink()
 
 
-class SaveTokenFileTests(unittest.TestCase):
-    """Writing the token out is the one time it touches disk on purpose."""
-
-    def test_writes_the_token_and_nothing_else(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "t.txt"
-            creds.save_token_file("tok-abc", path)
-            self.assertEqual(path.read_text(encoding="utf-8"), "tok-abc")
-
-    def test_file_is_readable_only_by_its_owner(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "t.txt"
-            creds.save_token_file("tok-abc", path)
-            self.assertEqual(path.stat().st_mode & 0o077, 0)
-
-    def test_refuses_to_write_inside_the_repository(self):
-        path = eo.REPOSITORY_ROOT / "token.txt"
-        with self.assertRaises(eo.SmokeError) as caught:
-            creds.save_token_file("tok-abc", path)
-        self.assertEqual(str(caught.exception), "token-file-in-repository")
-        self.assertFalse(path.exists())
-
-    def test_overwrites_an_earlier_token_without_leaving_the_old_one(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "t.txt"
-            creds.save_token_file("old-token-that-is-long", path)
-            creds.save_token_file("new", path)
-            self.assertEqual(path.read_text(encoding="utf-8"), "new")
-
-    def test_unwritable_location_raises(self):
-        with self.assertRaises(eo.SmokeError) as caught:
-            creds.save_token_file("tok", Path("/nope/nowhere/t.txt"))
-        self.assertEqual(str(caught.exception), "token-file-unwritable")
-
-    def test_round_trips_through_load_token(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "t.txt"
-            creds.save_token_file("tok-abc", path)
-            self.assertEqual(creds.load_token(token_file=path, env={}), "tok-abc")
-
-
 if __name__ == "__main__":
     unittest.main()

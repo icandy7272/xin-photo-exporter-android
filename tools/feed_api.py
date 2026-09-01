@@ -545,41 +545,6 @@ def run_list_children(
     return 0
 
 
-def run_save_token(
-    *,
-    token_file: Path,
-    adb_path: str | Path | None = None,
-    serial: str | None = None,
-    package: str = eo.PACKAGE,
-    run_command: Callable = eo.run_command,
-    printer: Callable[[str], None] = print,
-) -> int:
-    """Read the login token off the device and save it for later runs.
-
-    Worth doing before a trial-period emulator goes away: with the token on
-    disk, later top-up runs need no emulator at all.
-    """
-    try:
-        # Checked first: reading the login state costs an emulator boot.
-        creds.check_token_destination(token_file)
-        token, _ = creds.resolve_credentials(
-            read_prefs=creds.prefs_reader(
-                adb_path=adb_path,
-                serial=serial,
-                package=package,
-                run_command=run_command,
-            )
-        )
-        saved = creds.save_token_file(token, token_file)
-    except eo.SmokeError as exc:
-        printer(f"失败：{exc}")
-        return 1
-    printer(f"登录信息已保存到：{saved}")
-    printer("以后加上 --token-file 这个路径就能不开模拟器直接导出（到期前有效）。")
-    printer("⚠️ 这个文件等同于账号密码：别外发、别提交到 git，不用了就删掉。")
-    return 0
-
-
 def run_api(
     *,
     run_command: Callable = eo.run_command,
