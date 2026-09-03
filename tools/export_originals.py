@@ -185,11 +185,19 @@ def run_concurrently(
 
 
 def run_command(argv: list[str | Path]) -> subprocess.CompletedProcess[str]:
+    """Run a helper process and capture its output.
+
+    stdin is DEVNULL on purpose: `adb shell` reads and drains whatever stdin
+    it inherits, which ate the next answer the user had typed into the
+    wizard. Every caller here is non-interactive by construction (output is
+    always captured), so no child of this function ever needs our stdin.
+    """
     return subprocess.run(
         [str(value) for value in argv],
         capture_output=True,
         text=True,
         check=False,
+        stdin=subprocess.DEVNULL,
     )
 
 

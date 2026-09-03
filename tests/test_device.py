@@ -276,5 +276,28 @@ class ReadPrefsTests(unittest.TestCase):
         self.assertIn(["adb", "connect", "127.0.0.1:16384"], calls)
 
 
+class IsAppInstalledTests(unittest.TestCase):
+    """Telling "app missing" apart from "app not logged in" decides whether
+    the user is told to install the apk or to go log in."""
+
+    def _device(self):
+        return eo.Device(serial="emulator-5554", adb=Path("adb"))
+
+    def test_installed_when_pm_reports_a_path(self):
+        run = lambda argv: _completed("package:/data/app/~~x/base.apk\n")
+        self.assertTrue(device.is_app_installed(self._device(), "pkg", run))
+
+    def test_not_installed_when_pm_prints_nothing(self):
+        self.assertFalse(device.is_app_installed(self._device(), "pkg", lambda argv: _completed("")))
+
+    def test_not_installed_when_the_command_fails(self):
+        run = lambda argv: _completed("", 1, stderr="device offline")
+        self.assertFalse(device.is_app_installed(self._device(), "pkg", run))
+
+    def test_unrelated_output_is_not_mistaken_for_a_package(self):
+        run = lambda argv: _completed("Error: no such package\n")
+        self.assertFalse(device.is_app_installed(self._device(), "pkg", run))
+
+
 if __name__ == "__main__":
     unittest.main()

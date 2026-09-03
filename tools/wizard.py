@@ -148,6 +148,53 @@ def display_path(path: Path, home: Path | None = None) -> str:
         return str(path)
 
 
+def clean_dropped_path(raw: str) -> Path | None:
+    """Turn what Terminal produces when you drag a file in into a real path.
+
+    Dragging quotes the path or backslash-escapes its spaces, and neither
+    form opens as-is.
+    """
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1]
+    text = re.sub(r"\\(.)", r"\1", text).strip()
+    if not text:
+        return None
+    return Path(text).expanduser()
+
+
+def ensure_app_installed(
+    *,
+    is_installed: Callable[[], bool],
+    install_apk: Callable[[Path], bool],
+    input_fn: Callable = input,
+    printer: Callable[[str], None] = print,
+    max_attempts: int = MAX_LOGIN_ATTEMPTS,
+) -> bool:
+    """Make sure the app exists on the device before asking anyone to log in."""
+    for _ in range(max_attempts):
+        if is_installed():
+            return True
+        printer("")
+        printer("模拟器里还没有「鑫时光集家长版」。")
+        printer("装它有两个办法：")
+        printer("  · 把 apk 安装包直接拖进模拟器窗口，装好后回来按回车")
+        printer("  · 或者把 apk 拖到这个终端窗口里，我来装")
+        answer = input_fn("拖入 apk，或装好后按回车（输 q 退出）：")
+        if answer.strip().lower() in _QUIT_ANSWERS:
+            return False
+        apk = clean_dropped_path(answer)
+        if apk is None:
+            continue
+        if not apk.is_file():
+            printer(f"找不到这个文件：{apk}")
+            continue
+        printer(f"正在安装 {apk.name} …")
+        if not install_apk(apk):
+            printer("装不上。确认这是家长版的 apk，模拟器也还开着。")
+    return False
+
+
 def ensure_credentials(
     *,
     read_prefs: Callable[[], str],
@@ -208,8 +255,13 @@ def open_folder(path: Path, run_command: Callable = eo.run_command) -> None:
 
 
 def install_emulator(argv: list[str] | None = None) -> int:
-    """Hand off to the emulator installer (kept separate so tests can stub it)."""
-    return setup_emulator.main(argv or [])
+    """Hand off to the emulator installer (kept separate so tests can stub it).
+
+    ``--no-next-steps`` because the installer's own closing advice ("go back
+    to the terminal and run the export command") is wrong here: the user is
+    already inside the wizard, which gives the next step itself.
+    """
+    return setup_emulator.main(argv or ["--no-next-steps"])
 
 
 def ensure_device(
@@ -280,6 +332,25 @@ def choose_children(
         printer(f"没看懂，请输入 1 到 {len(summaries)} 之间的数字，或 a 表示全部。")
 
 
+def _app_present(adb_path, serial, package: str, run_command: Callable) -> bool:
+    try:
+        adb = android.find_adb(adb_path)
+        found = android.discover_device(adb=adb, serial=serial, run_command=run_command)
+        return android.is_app_installed(found, package, run_command)
+    except eo.SmokeError:
+        return False
+
+
+def _install_apk(adb_path, serial, apk: Path, run_command: Callable) -> bool:
+    try:
+        adb = android.find_adb(adb_path)
+        found = android.discover_device(adb=adb, serial=serial, run_command=run_command)
+    except eo.SmokeError:
+        return False
+    result = run_command([found.adb, "-s", found.serial, "install", "-r", str(apk)])
+    return "Success" in (result.stdout or "")
+
+
 def export_one(**kwargs) -> int:
     """Thin seam over the real exporter so the wizard stays testable."""
     return feed_api.run_api(**kwargs)
@@ -312,6 +383,14 @@ def run_wizard(
 
     if not ensure_device(
         adb_path=adb_path, serial=serial, input_fn=input_fn, printer=printer
+    ):
+        return 1
+
+    if not ensure_app_installed(
+        is_installed=lambda: _app_present(adb_path, serial, package, run_command),
+        install_apk=lambda apk: _install_apk(adb_path, serial, apk, run_command),
+        input_fn=input_fn,
+        printer=printer,
     ):
         return 1
 

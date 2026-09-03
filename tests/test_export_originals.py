@@ -537,5 +537,33 @@ class CliTests(unittest.TestCase):
             self.assertEqual(eo.main([]), 1)
 
 
+class RunCommandStdinTests(unittest.TestCase):
+    """Children must never inherit our stdin.
+
+    `adb shell` drains it, which swallowed the wizard's next answer and made
+    a piped run die with EOFError. run_command is always capture_output, i.e.
+    never interactive, so DEVNULL is always the right stdin for it.
+    """
+
+    def test_child_processes_get_no_stdin(self):
+        # Run in a child so this test can never hang the runner: the child
+        # calls run_command, then checks whether its own stdin survived.
+        probe = (
+            "import sys;"
+            f"sys.path.insert(0, {str(eo.REPOSITORY_ROOT)!r});"
+            "from tools import export_originals as eo;"
+            "eo.run_command([sys.executable, '-c', 'import sys; sys.stdin.read()']);"
+            "print('KEPT' if sys.stdin.readline().strip() else 'LOST')"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            input="sentinel\n",
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.stdout.strip(), "KEPT", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

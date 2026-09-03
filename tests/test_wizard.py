@@ -260,6 +260,99 @@ class AskFolderNameTests(unittest.TestCase):
             self.assertEqual(path, root / "小明")
 
 
+class CleanDroppedPathTests(unittest.TestCase):
+    """Dragging a file into Terminal produces escaped or quoted paths."""
+
+    def test_plain_path(self):
+        self.assertEqual(wizard.clean_dropped_path("/tmp/a.apk"), Path("/tmp/a.apk"))
+
+    def test_surrounding_whitespace_and_quotes(self):
+        for raw in ("  /tmp/a.apk  ", "'/tmp/a.apk'", '"/tmp/a.apk"'):
+            self.assertEqual(wizard.clean_dropped_path(raw), Path("/tmp/a.apk"))
+
+    def test_backslash_escaped_spaces(self):
+        self.assertEqual(
+            wizard.clean_dropped_path("/tmp/my\\ app.apk"), Path("/tmp/my app.apk")
+        )
+
+    def test_tilde_is_expanded(self):
+        self.assertEqual(
+            wizard.clean_dropped_path("~/a.apk"), Path.home() / "a.apk"
+        )
+
+    def test_empty_is_none(self):
+        self.assertIsNone(wizard.clean_dropped_path("   "))
+
+
+class EnsureAppInstalledTests(unittest.TestCase):
+    def test_installed_app_asks_nothing(self):
+        ok = wizard.ensure_app_installed(
+            is_installed=lambda: True, install_apk=lambda p: True,
+            input_fn=_answers(), printer=lambda m: None,
+        )
+        self.assertTrue(ok)
+
+    def test_missing_app_tells_the_user_to_install_the_apk_not_to_log_in(self):
+        """The old flow said "open the app" when no app existed."""
+        lines: list[str] = []
+        wizard.ensure_app_installed(
+            is_installed=lambda: False, install_apk=lambda p: True,
+            input_fn=_answers("q"), printer=lines.append,
+        )
+        text = "\n".join(lines)
+        self.assertIn("apk", text.lower())
+        self.assertNotIn("用你自己的账号登录", text)
+
+    def test_a_dropped_apk_path_gets_installed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            apk = Path(tmp) / "x.apk"
+            apk.write_bytes(b"PK")
+            installed: list[Path] = []
+            states = iter([False, True])
+            ok = wizard.ensure_app_installed(
+                is_installed=lambda: next(states),
+                install_apk=lambda p: installed.append(p) or True,
+                input_fn=_answers(str(apk)), printer=lambda m: None,
+            )
+        self.assertTrue(ok)
+        self.assertEqual(installed, [apk])
+
+    def test_a_path_that_does_not_exist_is_called_out(self):
+        lines: list[str] = []
+        wizard.ensure_app_installed(
+            is_installed=lambda: False, install_apk=lambda p: True,
+            input_fn=_answers("/tmp/definitely-not-here.apk", "q"), printer=lines.append,
+        )
+        self.assertIn("找不到这个文件", "\n".join(lines))
+
+    def test_manual_install_then_enter_rechecks(self):
+        states = iter([False, True])
+        ok = wizard.ensure_app_installed(
+            is_installed=lambda: next(states), install_apk=lambda p: True,
+            input_fn=_answers(""), printer=lambda m: None,
+        )
+        self.assertTrue(ok)
+
+    def test_quitting_returns_false(self):
+        ok = wizard.ensure_app_installed(
+            is_installed=lambda: False, install_apk=lambda p: True,
+            input_fn=_answers("q"), printer=lambda m: None,
+        )
+        self.assertFalse(ok)
+
+    def test_a_failed_install_is_reported_and_retried(self):
+        lines: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            apk = Path(tmp) / "bad.apk"
+            apk.write_bytes(b"not really an apk")
+            ok = wizard.ensure_app_installed(
+                is_installed=lambda: False, install_apk=lambda p: False,
+                input_fn=_answers(str(apk), "q"), printer=lines.append,
+            )
+        self.assertFalse(ok)
+        self.assertIn("装不上", "\n".join(lines))
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -375,6 +468,7 @@ class RunWizardTests(unittest.TestCase):
 
         lines: list[str] = []
         with mock.patch.object(wizard, "ensure_device", return_value=True), \
+                mock.patch.object(wizard, "ensure_app_installed", return_value=True), \
                 mock.patch.object(wizard, "ensure_credentials", return_value=("tok", (_UUID, _UUID2))), \
                 mock.patch.object(wizard, "describe_children", return_value=[
                     wizard.ChildSummary(_UUID, "2026-04-30", "做手工", 3),
@@ -433,9 +527,21 @@ class RunWizardTests(unittest.TestCase):
             rc, _, _, opener = self._run(["1", "小明"], exports=[1], tmp=tmp)
         self.assertEqual(rc, 1)
 
+    def test_stops_when_the_app_is_not_installed(self):
+        """No app means the login instructions would be a dead end."""
+        with mock.patch.object(wizard, "ensure_device", return_value=True), \
+                mock.patch.object(wizard, "ensure_app_installed", return_value=False), \
+                mock.patch.object(wizard, "ensure_credentials") as creds_step, \
+                mock.patch.object(wizard, "export_one") as export:
+            rc = wizard.run_wizard(input_fn=_answers(), printer=lambda m: None)
+        self.assertEqual(rc, 1)
+        creds_step.assert_not_called()
+        export.assert_not_called()
+
     def test_stops_cleanly_when_the_user_quits_at_login(self):
         lines: list[str] = []
         with mock.patch.object(wizard, "ensure_device", return_value=True), \
+                mock.patch.object(wizard, "ensure_app_installed", return_value=True), \
                 mock.patch.object(wizard, "ensure_credentials", return_value=None), \
                 mock.patch.object(wizard, "export_one") as export:
             rc = wizard.run_wizard(input_fn=_answers(), printer=lines.append)

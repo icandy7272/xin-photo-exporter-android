@@ -163,6 +163,23 @@ def discover_device(
     return eo.Device(serial=serials[0], adb=adb)
 
 
+def is_app_installed(
+    device: eo.Device,
+    package: str = eo.PACKAGE,
+    run_command: Callable = eo.run_command,
+) -> bool:
+    """Whether the app is on the device at all.
+
+    Distinguishing this from "not logged in" matters: the two need opposite
+    instructions, and telling someone to open an app they never installed is
+    a dead end.
+    """
+    result = run_command([device.adb, "-s", device.serial, "shell", "pm", "path", package])
+    if result.returncode != 0:
+        return False
+    return "package:" in (result.stdout or "")
+
+
 def _shell(device: eo.Device, command: str, run_command: Callable) -> tuple[str, str]:
     """Run one adb shell command; return (stdout, stderr).
 

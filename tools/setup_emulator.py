@@ -481,6 +481,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-start", action="store_true", help="只准备好，不启动模拟器"
     )
+    parser.add_argument(
+        "--no-next-steps",
+        action="store_true",
+        help=argparse.SUPPRESS,  # 向导内部用：后续步骤由向导自己说，避免两套矛盾指引
+    )
     return parser
 
 
@@ -515,10 +520,11 @@ def main(argv: list[str] | None = None) -> int:
         set_chinese_locale(sdk, serial)
         if args.apk:
             install_apk(sdk, serial, args.apk)
-        _say("")
-        _say("模拟器已就绪。请在模拟器窗口里打开鑫时光集、用你自己的账号登录，")
-        _say("并进一次照片页面，然后回到终端运行导出命令。")
-        _say("用完想清除登录信息：python3 tools/setup_emulator.py --delete")
+        if not args.no_next_steps:
+            _say("")
+            _say("模拟器已就绪。请在模拟器窗口里打开鑫时光集、用你自己的账号登录，")
+            _say("并进一次照片页面，然后回到终端运行导出命令。")
+            _say("用完想清除登录信息：python3 tools/setup_emulator.py --delete")
     except eo.SmokeError as exc:
         print(f"失败：{exc}")
         return 1
