@@ -328,14 +328,14 @@ class EnsureAppInstalledTests(unittest.TestCase):
 
     def test_a_dropped_apk_path_gets_installed(self):
         with tempfile.TemporaryDirectory() as tmp:
-            apk = Path(tmp) / "x.apk"
-            apk.write_bytes(b"PK")
+            apk = _make_apk(Path(tmp) / "x.apk")
             installed: list[Path] = []
             states = iter([False, True])
             ok = wizard.ensure_app_installed(
                 is_installed=lambda: next(states),
                 install_apk=lambda p: installed.append(p) or True,
-                input_fn=_answers(str(apk)), printer=lambda m: None,
+                # "y" confirms the unknown-hash warning this fixture triggers.
+                input_fn=_answers(str(apk), "y"), printer=lambda m: None,
             )
         self.assertTrue(ok)
         self.assertEqual(installed, [apk])
@@ -366,14 +366,133 @@ class EnsureAppInstalledTests(unittest.TestCase):
     def test_a_failed_install_is_reported_and_retried(self):
         lines: list[str] = []
         with tempfile.TemporaryDirectory() as tmp:
-            apk = Path(tmp) / "bad.apk"
-            apk.write_bytes(b"not really an apk")
+            apk = _make_apk(Path(tmp) / "bad.apk")
             ok = wizard.ensure_app_installed(
                 is_installed=lambda: False, install_apk=lambda p: False,
-                input_fn=_answers(str(apk), "q"), printer=lines.append,
+                input_fn=_answers(str(apk), "y", "q"), printer=lines.append,
             )
         self.assertFalse(ok)
         self.assertIn("装不上", "\n".join(lines))
+
+
+def _make_apk(path: Path, *, manifest=True, dex=True, extra=b""):
+    """A minimal file shaped like an APK (a zip with the telltale entries)."""
+    import zipfile
+    with zipfile.ZipFile(path, "w") as z:
+        if manifest:
+            z.writestr("AndroidManifest.xml", "binary-xml" + extra.decode("latin1"))
+        if dex:
+            z.writestr("classes.dex", "dex")
+        z.writestr("META-INF/CERT.RSA", "sig")
+    return path
+
+
+class InspectApkTests(unittest.TestCase):
+    """Catch the wrong file before adb does, and say why in plain words."""
+
+    def test_a_well_formed_apk_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            apk = _make_apk(Path(tmp) / "a.apk")
+            report = wizard.inspect_apk(apk)
+        self.assertTrue(report.looks_like_apk)
+        self.assertEqual(len(report.sha256), 64)
+
+    def test_a_non_zip_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "notes.txt"
+            bad.write_text("just some text")
+            report = wizard.inspect_apk(bad)
+        self.assertFalse(report.looks_like_apk)
+        self.assertIn("不是", report.problem)
+
+    def test_a_zip_without_android_parts_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            apk = _make_apk(Path(tmp) / "a.apk", manifest=False, dex=False)
+            report = wizard.inspect_apk(apk)
+        self.assertFalse(report.looks_like_apk)
+
+    def test_sha256_matches_hashlib(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            apk = _make_apk(Path(tmp) / "a.apk")
+            expected = hashlib.sha256(apk.read_bytes()).hexdigest()
+            self.assertEqual(wizard.inspect_apk(apk).sha256, expected)
+
+    def test_two_different_files_hash_differently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = _make_apk(Path(tmp) / "a.apk")
+            b = _make_apk(Path(tmp) / "b.apk", extra=b"tampered")
+            self.assertNotEqual(wizard.inspect_apk(a).sha256, wizard.inspect_apk(b).sha256)
+
+
+class ApkTrustTests(unittest.TestCase):
+    """A repackaged apk shows a normal login screen and steals the password,
+    so a hash mismatch has to be loud - but not a hard block, since the
+    vendor ships new versions we cannot know about in advance."""
+
+    def test_known_hash_is_reported_as_matching(self):
+        verdict = wizard.judge_apk_trust("a" * 64, known={"a" * 64: "1.9.17"})
+        self.assertTrue(verdict.trusted)
+        self.assertIn("1.9.17", verdict.message)
+
+    def test_unknown_hash_warns_loudly(self):
+        verdict = wizard.judge_apk_trust("b" * 64, known={"a" * 64: "1.9.17"})
+        self.assertFalse(verdict.trusted)
+        for word in ("改过", "登录"):
+            self.assertIn(word, verdict.message)
+
+    def test_no_known_hashes_means_no_false_confidence(self):
+        verdict = wizard.judge_apk_trust("b" * 64, known={})
+        self.assertFalse(verdict.trusted)
+
+    def test_verdict_never_claims_more_than_a_hash_can_prove(self):
+        """A match proves "same bytes as the one we pinned", not "official"."""
+        verdict = wizard.judge_apk_trust("a" * 64, known={"a" * 64: "1.9.17"})
+        self.assertNotIn("官方", verdict.message)
+
+
+class EnsureAppInstalledChecksApkTests(unittest.TestCase):
+    def test_a_file_that_is_not_an_apk_is_refused_before_adb(self):
+        installed: list = []
+        lines: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "photo.jpg"
+            bad.write_bytes(b"\xff\xd8not an apk")
+            wizard.ensure_app_installed(
+                is_installed=lambda: False,
+                install_apk=lambda p: installed.append(p) or True,
+                input_fn=_answers(str(bad), "q"),
+                printer=lines.append,
+            )
+        self.assertEqual(installed, [], "adb must not be handed a non-apk")
+        self.assertIn("不是", "\n".join(lines))
+
+    def test_an_unrecognised_apk_warns_but_still_installs_when_confirmed(self):
+        installed: list = []
+        lines: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            apk = _make_apk(Path(tmp) / "unknown.apk")
+            states = iter([False, True])
+            wizard.ensure_app_installed(
+                is_installed=lambda: next(states),
+                install_apk=lambda p: installed.append(p) or True,
+                input_fn=_answers(str(apk), "y"),
+                printer=lines.append,
+            )
+        self.assertEqual(len(installed), 1)
+        self.assertIn("改过", "\n".join(lines))
+
+    def test_declining_the_warning_skips_the_install(self):
+        installed: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            apk = _make_apk(Path(tmp) / "unknown.apk")
+            wizard.ensure_app_installed(
+                is_installed=lambda: False,
+                install_apk=lambda p: installed.append(p) or True,
+                input_fn=_answers(str(apk), "n", "q"),
+                printer=lambda m: None,
+            )
+        self.assertEqual(installed, [])
 
 
 if __name__ == "__main__":

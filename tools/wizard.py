@@ -17,8 +17,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import re
 import subprocess
+import zipfile
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +45,13 @@ CAPTION_LIMIT = 24
 DEFAULT_EXPORT_DIRNAME = "鑫时光集导出"
 # Enough tries for a real login, few enough that a wedged run still ends.
 MAX_LOGIN_ATTEMPTS = 10
+# SHA-256 of apks we have actually handled, mapped to their version. A match
+# only proves "byte-identical to the copy we pinned" - never "official" - so
+# the wording downstream stays modest. New app versions will not be in here;
+# that is why a mismatch warns instead of blocking.
+KNOWN_APK_HASHES = {
+    "9394e2d829fcd2c29f01b390883e28dab82098216af4029c14f7ad8eaf2aae85": "1.9.17",
+}
 _SEPARATORS = re.compile(r"[,\s、，]+")
 _DATE_PREFIX = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 _QUIT_ANSWERS = frozenset({"q", "quit", "退出"})
@@ -163,6 +173,63 @@ def display_path(path: Path, home: Path | None = None) -> str:
         return str(path)
 
 
+@dataclass(frozen=True)
+class ApkReport:
+    looks_like_apk: bool
+    sha256: str
+    problem: str = ""
+
+
+@dataclass(frozen=True)
+class ApkVerdict:
+    trusted: bool
+    message: str
+
+
+def inspect_apk(path: Path) -> ApkReport:
+    """Check the file really is an Android package, and hash it.
+
+    Catching a wrong file here gives a sentence the user can act on, instead
+    of adb's opaque failure a minute later.
+    """
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return ApkReport(False, "", "读不到这个文件")
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as bundle:
+            names = bundle.namelist()
+    except (zipfile.BadZipFile, OSError):
+        return ApkReport(False, digest, "这个文件不是安卓安装包（apk）")
+    if "AndroidManifest.xml" not in names or not any(
+        n.startswith("classes") and n.endswith(".dex") for n in names
+    ):
+        return ApkReport(False, digest, "这个文件不是安卓安装包（apk）")
+    return ApkReport(True, digest)
+
+
+def judge_apk_trust(
+    sha256: str, known: dict[str, str] = KNOWN_APK_HASHES
+) -> ApkVerdict:
+    """Say whether this apk is byte-identical to one we have pinned.
+
+    Deliberately not a hard block: the vendor ships versions we cannot know
+    about, and refusing every new one would strand users. But the warning is
+    blunt, because a repackaged apk shows a normal login screen while
+    handing the account to someone else.
+    """
+    version = known.get(sha256)
+    if version:
+        return ApkVerdict(True, f"校验通过：与已记录的 {version} 版完全一致。")
+    return ApkVerdict(
+        False,
+        "⚠️ 这个 apk 和已记录的版本对不上。可能只是版本更新了，"
+        "也可能被人改过——被改过的安装包会照常显示登录界面，"
+        "却把你的账号发给别人。只装你信得过的人直接发给你的文件。",
+    )
+
+
 def clean_dropped_path(raw: str) -> Path | None:
     """Turn what Terminal produces when you drag a file in into a real path.
 
@@ -204,6 +271,16 @@ def ensure_app_installed(
         if not apk.is_file():
             printer(f"找不到这个文件：{apk}")
             continue
+        report = inspect_apk(apk)
+        if not report.looks_like_apk:
+            printer(report.problem + "。请确认拖的是 .apk 安装包。")
+            continue
+        verdict = judge_apk_trust(report.sha256)
+        printer(verdict.message)
+        if not verdict.trusted:
+            printer(f"这个文件的校验码：{report.sha256}")
+            if not input_fn("仍然要安装吗？（y=装 / 其他=不装）：").strip().lower().startswith("y"):
+                continue
         printer(f"正在安装 {apk.name} …")
         if not install_apk(apk):
             printer("装不上。确认这是家长版的 apk，模拟器也还开着。")
