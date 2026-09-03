@@ -43,6 +43,7 @@ DEFAULT_EXPORT_DIRNAME = "鑫时光集导出"
 # Enough tries for a real login, few enough that a wedged run still ends.
 MAX_LOGIN_ATTEMPTS = 10
 _SEPARATORS = re.compile(r"[,\s、，]+")
+_DATE_PREFIX = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 _QUIT_ANSWERS = frozenset({"q", "quit", "退出"})
 _ALL_ANSWERS = frozenset({"a", "all", "全部", "都要"})
 
@@ -69,6 +70,16 @@ def excerpt(text: str, limit: int = CAPTION_LIMIT) -> str:
     return collapsed[:limit] + "…"
 
 
+def format_date(raw: str) -> str:
+    """Show `2026-04-30`, not `2026-04-30T09:00:13.491Z`.
+
+    The feed returns full ISO timestamps; the menu only needs the day, and
+    the raw form is noise to whoever is trying to recognise their child.
+    """
+    match = _DATE_PREFIX.match(raw)
+    return match.group(1) if match else raw
+
+
 def summarise_child(child_id: str, records: Sequence) -> ChildSummary:
     """Describe one archive from a sampled page of its feed."""
     latest_time = ""
@@ -92,7 +103,11 @@ def summarise_child(child_id: str, records: Sequence) -> ChildSummary:
 
 def format_child_line(index: int, summary: ChildSummary) -> str:
     """One menu row. Deliberately never shows the child id."""
-    parts = [f"最近更新 {summary.latest_time}" if summary.latest_time else "暂无内容"]
+    parts = [
+        f"最近更新 {format_date(summary.latest_time)}"
+        if summary.latest_time
+        else "暂无内容"
+    ]
     if summary.sampled_photos:
         parts.append(f"近期 {summary.sampled_photos} 张照片")
     if summary.caption_excerpt:

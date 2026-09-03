@@ -119,6 +119,29 @@ class FormatChildLineTests(unittest.TestCase):
         self.assertTrue(line.strip())
 
 
+class FormatDateTests(unittest.TestCase):
+    """The API returns full ISO timestamps; parents want a date."""
+
+    def test_iso_timestamp_is_cut_to_the_date(self):
+        self.assertEqual(wizard.format_date("2026-04-30T09:00:13.491Z"), "2026-04-30")
+
+    def test_a_plain_date_is_unchanged(self):
+        self.assertEqual(wizard.format_date("2026-04-30"), "2026-04-30")
+
+    def test_unexpected_shapes_pass_through(self):
+        self.assertEqual(wizard.format_date("稍后"), "稍后")
+        self.assertEqual(wizard.format_date(""), "")
+
+
+class MenuShowsAFriendlyDateTests(unittest.TestCase):
+    def test_menu_line_has_no_raw_timestamp(self):
+        summary = wizard.ChildSummary(_UUID, "2026-04-30T09:00:13.491Z", "做手工", 3)
+        line = wizard.format_child_line(1, summary)
+        self.assertIn("2026-04-30", line)
+        self.assertNotIn("T09:00", line)
+        self.assertNotIn("491Z", line)
+
+
 class ParseChildSelectionTests(unittest.TestCase):
     def test_single_number_is_zero_indexed(self):
         self.assertEqual(wizard.parse_child_selection("1", 2), (0,))
