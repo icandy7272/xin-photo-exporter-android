@@ -71,6 +71,8 @@ AVD_DROP_KEYS = ("disk.dataPartition.path",)
 BOOT_TIMEOUT_SECONDS = 600
 # Adoptium's CDN returns 403 to urllib's default User-Agent.
 DOWNLOAD_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+# The emulator defaults to English and a +1 dial code; both make login harder.
+TARGET_LOCALE = "zh-CN"
 
 
 # --- pure helpers (unit-tested) ---------------------------------------------
@@ -406,20 +408,53 @@ def wait_for_boot(sdk: Sdk, timeout: int = BOOT_TIMEOUT_SECONDS) -> str:
     raise eo.SmokeError("emulator-boot-timeout")
 
 
+def apply_locale(
+    sdk: Sdk,
+    serial: str,
+    *,
+    locale: str = TARGET_LOCALE,
+    attempts: int = 5,
+    pause: float = 2.0,
+) -> bool:
+    """Set the system locale and read it back; True once it actually stuck.
+
+    `adb root` restarts adbd, and the first setprop after that can land on a
+    connection that is going away — `adb shell` reports success either way,
+    so the write vanishes silently. Observed on a real AVD: the emulator
+    stayed in English while setup announced Chinese. Hence read-back and
+    retry rather than a fixed sleep.
+    """
+    adb = sdk.tool("adb")
+    command = (
+        f"setprop persist.sys.locale {locale}; "
+        f"setprop persist.sys.language {locale.split('-')[0]}; "
+        f"setprop persist.sys.country {locale.split('-')[1]}"
+    )
+    for attempt in range(attempts):
+        sdk.run([adb, "-s", serial, "shell", command])
+        readback = sdk.run(
+            [adb, "-s", serial, "shell", "getprop", "persist.sys.locale"]
+        ).stdout.strip()
+        if readback == locale:
+            return True
+        if attempt < attempts - 1:
+            time.sleep(pause)
+    return False
+
+
 def set_chinese_locale(sdk: Sdk, serial: str) -> None:
     """Chinese UI and a +86 dial code; the default is English and +1."""
     adb = sdk.tool("adb")
     sdk.run([adb, "-s", serial, "root"])
     time.sleep(2)
     sdk.run([adb, "-s", serial, "wait-for-device"])
-    sdk.run(
-        [
-            adb, "-s", serial, "shell",
-            "setprop persist.sys.locale zh-CN; "
-            "setprop persist.sys.language zh; setprop persist.sys.country CN",
-        ]
-    )
-    _say("已设为中文，正在重启模拟器…")
+    if apply_locale(sdk, serial):
+        _say("已设为中文，正在重启模拟器…")
+    else:
+        # Never claim a success we could not verify: the user is about to
+        # look at the window and needs to know why it is not Chinese.
+        _say("提示：没能把系统语言设成中文，模拟器界面会是英文的（不影响导出）。")
+        _say("      想手动改：Settings → System → Languages → 添加「简体中文」并拖到最上面。")
     sdk.run([adb, "-s", serial, "reboot"])
     time.sleep(8)
     wait_for_boot(sdk)

@@ -3,6 +3,7 @@ import io
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import urllib.request
 from pathlib import Path
 
@@ -257,6 +258,75 @@ class WaitUntilGoneTests(unittest.TestCase):
 
     def test_gives_up_after_the_timeout(self):
         self.assertFalse(se.wait_until_gone(lambda: True, timeout=0, interval=0))
+
+
+class ApplyLocaleTests(unittest.TestCase):
+    """`adb root` restarts adbd, so the first setprop after it can land on a
+    dying connection and silently no-op — `adb shell` returns 0 either way.
+    Observed on a real AVD: the script announced success while the emulator
+    stayed in English. So the write must be read back, not trusted."""
+
+    class _Sdk:
+        """Fake Sdk whose getprop answers come from a scripted queue."""
+
+        def __init__(self, readbacks):
+            self.readbacks = list(readbacks)
+            self.setprop_calls = 0
+
+        def tool(self, name):
+            return Path("adb")
+
+        def run(self, argv, **kwargs):
+            text = " ".join(str(a) for a in argv)
+            if "setprop" in text:
+                self.setprop_calls += 1
+                return _completed("")
+            if "getprop" in text:
+                value = self.readbacks.pop(0) if self.readbacks else ""
+                return _completed(value + "\n")
+            return _completed("")
+
+    def test_succeeds_when_the_value_reads_back(self):
+        sdk = self._Sdk([se.TARGET_LOCALE])
+        self.assertTrue(se.apply_locale(sdk, "emulator-5554", pause=0))
+        self.assertEqual(sdk.setprop_calls, 1)
+
+    def test_retries_when_the_write_silently_did_not_stick(self):
+        # First readback empty (the adbd-restart race), second one good.
+        sdk = self._Sdk(["", se.TARGET_LOCALE])
+        self.assertTrue(se.apply_locale(sdk, "emulator-5554", pause=0))
+        self.assertEqual(sdk.setprop_calls, 2)
+
+    def test_gives_up_after_the_attempt_budget(self):
+        sdk = self._Sdk([""] * 10)
+        self.assertFalse(se.apply_locale(sdk, "emulator-5554", attempts=3, pause=0))
+        self.assertEqual(sdk.setprop_calls, 3)
+
+    def test_a_different_locale_is_not_accepted_as_success(self):
+        sdk = self._Sdk(["en-US"] * 10)
+        self.assertFalse(se.apply_locale(sdk, "emulator-5554", attempts=2, pause=0))
+
+
+class SetChineseLocaleHonestyTests(unittest.TestCase):
+    def test_does_not_claim_success_when_the_locale_never_took(self):
+        said = []
+        with mock.patch.object(se, "apply_locale", return_value=False), \
+                mock.patch.object(se, "wait_for_boot", return_value="emulator-5554"), \
+                mock.patch.object(se.time, "sleep"), \
+                mock.patch.object(se, "_say", side_effect=said.append):
+            se.set_chinese_locale(ApplyLocaleTests._Sdk([]), "emulator-5554")
+        text = "\n".join(said)
+        self.assertNotIn("已设为中文", text)
+        self.assertIn("英文", text)  # tells the user what they will actually see
+
+    def test_says_so_when_it_worked(self):
+        said = []
+        with mock.patch.object(se, "apply_locale", return_value=True), \
+                mock.patch.object(se, "wait_for_boot", return_value="emulator-5554"), \
+                mock.patch.object(se.time, "sleep"), \
+                mock.patch.object(se, "_say", side_effect=said.append):
+            se.set_chinese_locale(ApplyLocaleTests._Sdk([]), "emulator-5554")
+        self.assertIn("已设为中文", "\n".join(said))
 
 
 if __name__ == "__main__":

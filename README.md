@@ -315,4 +315,5 @@ python3 tools/export_originals.py api --child-id <档案ID> --out ~/Desktop/导�
 - 设备层与模拟器品牌无关：读 prefs 时依次尝试直接 `cat`、`adb root` 后重试、`su -c`，因此 Google APIs 镜像、MuMu 和已 root 真机走同一条代码路径。
 - 两类失败必须分清：**读不到** `/data/data`（Root/镜像问题）报 `prefs-read-failed`；**读到了但没有登录态**报 `credentials-not-found`。判据是 prefs XML 的根元素 `<map>`——不能用 `<string>`，App 装了没登录时 prefs 里可能一个字符串都没有。
 - `setup_emulator.py` 固化了三个实测踩过的坑：必须 `google_apis` 镜像（`google_play` 禁用 root）、必须删掉 `disk.dataPartition.path=<temp>`（否则重启丢登录态）、locale 设 `zh-CN`（默认英文 + 区号 +1）。
+- locale 必须**写完回读**：`adb root` 会重启 adbd，紧跟其后的 `setprop` 可能落在正在关闭的连接上，而 `adb shell` 无论成败都返回 0，失败是静默的。实测踩到过——脚本打印「已设为中文」，模拟器界面却还是英文。`apply_locale` 因此写完读回、不符就重试；确实设不上就如实告知并给出手动改法，不假装成功。
 - 工作原理：从 App 的 `shared_prefs` 读取登录态，翻页调用后端 `moment/FamilyMoment/v2/getPageMomentList` 接口（`counter` 游标 + `hasMore` 分页），抽取每条帖子的正文、照片（`pictureURLs`）、视频（`videoUrl`），交给本地下载器。只拉 JSON、不渲染图片，低内存、可导全库。
